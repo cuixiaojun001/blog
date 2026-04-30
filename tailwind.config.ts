@@ -8,15 +8,15 @@ const config: Config = {
     extend: {
       colors: {
         warm: {
-          bg: '#faf8f5',
-          surface: '#f5efe5',
-          border: '#e8e0d5',
-          muted: '#9b8c7c',
-          text: '#5c4f3d',
-          heading: '#3d3226',
-          accent: '#c4a97d',
-          tag: '#efe8db',
-          'tag-text': '#6b5c47',
+          bg: 'rgb(var(--color-bg) / <alpha-value>)',
+          surface: 'rgb(var(--color-surface) / <alpha-value>)',
+          border: 'rgb(var(--color-border) / <alpha-value>)',
+          muted: 'rgb(var(--color-muted) / <alpha-value>)',
+          text: 'rgb(var(--color-text) / <alpha-value>)',
+          heading: 'rgb(var(--color-heading) / <alpha-value>)',
+          accent: 'rgb(var(--color-accent) / <alpha-value>)',
+          tag: 'rgb(var(--color-tag) / <alpha-value>)',
+          'tag-text': 'rgb(var(--color-tag-text) / <alpha-value>)',
         },
       },
       fontFamily: {

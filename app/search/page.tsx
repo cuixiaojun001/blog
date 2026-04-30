@@ -11,7 +11,7 @@ export default function SearchPage() {
 
   return (
     <div className="max-w-4xl mx-auto px-4 py-12">
-      <h1 className="text-3xl font-bold font-serif text-[rgb(var(--color-heading))] mb-8">
+      <h1 className="text-3xl font-bold font-serif text-warm-heading mb-8">
         Search
       </h1>
       <SearchBar allPosts={allPosts} />

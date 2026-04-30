@@ -49,21 +49,21 @@ export default async function PostPage({ params }: Props) {
     <div className="max-w-4xl mx-auto px-4 py-8">
       <article>
         <header className="mb-8">
-          <div className="text-sm text-[rgb(var(--color-muted))] mb-2">
+          <div className="text-sm text-warm-muted mb-2">
             {post.date}
             <span className="mx-2">·</span>
             <span className="uppercase">{post.category}</span>
           </div>
-          <h1 className="text-3xl font-bold font-serif text-[rgb(var(--color-heading))] leading-tight mb-4">
+          <h1 className="text-3xl font-bold font-serif text-warm-heading leading-tight mb-4">
             {post.title}
           </h1>
           {post.excerpt && (
-            <p className="text-[rgb(var(--color-muted))] text-lg">{post.excerpt}</p>
+            <p className="text-warm-muted text-lg">{post.excerpt}</p>
           )}
           <div className="flex flex-wrap gap-1.5 mt-4">
             {post.tags.map(tag => (
               <span key={tag} className="text-xs px-2 py-0.5 rounded-md
-                bg-[rgb(var(--color-tag))] text-[rgb(var(--color-tag-text))]">
+                bg-warm-tag text-warm-tag-text">
                 {tag}
               </span>
             ))}
@@ -87,7 +87,7 @@ export default async function PostPage({ params }: Props) {
         </div>
       </article>
 
-      <div className="max-w-reading mx-auto mt-12 pt-8 border-t border-[rgb(var(--color-border))]">
+      <div className="max-w-reading mx-auto mt-12 pt-8 border-t border-warm-border">
         <Giscus />
       </div>
     </div>

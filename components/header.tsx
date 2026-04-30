@@ -17,9 +17,9 @@ export function Header() {
   const [open, setOpen] = useState(false)
 
   return (
-    <header className="border-b border-[rgb(var(--color-border))]">
+    <header className="border-b border-warm-border">
       <div className="max-w-4xl mx-auto px-4 h-16 flex items-center justify-between">
-        <Link href="/" className="font-serif font-bold text-xl text-[rgb(var(--color-heading))]">
+        <Link href="/" className="font-serif font-bold text-xl text-warm-heading">
           Your Blog
         </Link>
 
@@ -31,8 +31,8 @@ export function Header() {
               href={l.href}
               className={`transition-colors ${
                 (l.href === '/' ? pathname === '/' : pathname.startsWith(l.href))
-                  ? 'text-[rgb(var(--color-heading))] font-medium'
-                  : 'text-[rgb(var(--color-muted))] hover:text-[rgb(var(--color-heading))]'
+                  ? 'text-warm-heading font-medium'
+                  : 'text-warm-muted hover:text-warm-heading'
               }`}
             >
               {l.label}
@@ -40,7 +40,7 @@ export function Header() {
           ))}
           <Link
             href="/search"
-            className="text-[rgb(var(--color-muted))] hover:text-[rgb(var(--color-heading))]"
+            className="text-warm-muted hover:text-warm-heading"
             aria-label="Search"
           >
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -53,7 +53,7 @@ export function Header() {
 
         {/* Mobile hamburger */}
         <button
-          className="sm:hidden p-2 text-[rgb(var(--color-muted))]"
+          className="sm:hidden p-2 text-warm-muted"
           onClick={() => setOpen(!open)}
           aria-label="Toggle menu"
           aria-expanded={open}
@@ -70,20 +70,20 @@ export function Header() {
 
       {/* Mobile menu */}
       {open && (
-        <div className="sm:hidden border-t border-[rgb(var(--color-border))] px-4 py-4 space-y-3">
+        <div className="sm:hidden border-t border-warm-border px-4 py-4 space-y-3">
           {links.map(l => (
             <Link
               key={l.href}
               href={l.href}
               onClick={() => setOpen(false)}
-              className="block text-sm text-[rgb(var(--color-muted))] hover:text-[rgb(var(--color-heading))]"
+              className="block text-sm text-warm-muted hover:text-warm-heading"
             >
               {l.label}
             </Link>
           ))}
           <div className="flex items-center gap-4 pt-2">
             <Link href="/search" onClick={() => setOpen(false)}
-              className="text-[rgb(var(--color-muted))]">
+              className="text-warm-muted">
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                   d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />

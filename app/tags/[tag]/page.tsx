@@ -25,13 +25,13 @@ export default async function TagPage({ params }: Props) {
   return (
     <div className="max-w-4xl mx-auto px-4 py-12">
       <header className="mb-8">
-        <Link href="/tags" className="text-sm text-[rgb(var(--color-muted))] hover:text-[rgb(var(--color-heading))]">
+        <Link href="/tags" className="text-sm text-warm-muted hover:text-warm-heading">
           ← All tags
         </Link>
-        <h1 className="text-3xl font-bold font-serif text-[rgb(var(--color-heading))] mt-2">
+        <h1 className="text-3xl font-bold font-serif text-warm-heading mt-2">
           {tag}
         </h1>
-        <p className="text-[rgb(var(--color-muted))] mt-1">
+        <p className="text-warm-muted mt-1">
           {posts.length} {posts.length === 1 ? 'post' : 'posts'}
         </p>
       </header>

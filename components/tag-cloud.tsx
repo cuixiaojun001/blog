@@ -3,7 +3,7 @@ import type { TagCount } from '@/lib/tags'
 
 export function TagCloud({ tags }: { tags: TagCount[] }) {
   if (tags.length === 0) {
-    return <p className="text-[rgb(var(--color-muted))] text-center py-8">No tags yet</p>
+    return <p className="text-warm-muted text-center py-8">No tags yet</p>
   }
 
   const maxCount = tags[0]?.count ?? 1
@@ -18,8 +18,8 @@ export function TagCloud({ tags }: { tags: TagCount[] }) {
             key={tag}
             href={`/tags/${tag}`}
             className="inline-block px-3 py-1.5 rounded-lg transition-colors
-              bg-[rgb(var(--color-tag))] text-[rgb(var(--color-tag-text))]
-              hover:bg-[rgb(var(--color-accent))] hover:text-white"
+              bg-warm-tag text-warm-tag-text
+              hover:bg-warm-accent hover:text-white"
             style={{ fontSize: size }}
           >
             {tag}

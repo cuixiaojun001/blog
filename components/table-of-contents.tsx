@@ -56,7 +56,7 @@ export function TableOfContents({ headings }: { headings: HeadingItem[] }) {
         {collapsed ? (
           <button
             onClick={toggle}
-            className="text-xs text-[rgb(var(--color-muted))] hover:text-[rgb(var(--color-heading))] transition-colors py-2"
+            className="text-xs text-warm-muted hover:text-warm-heading transition-colors py-2"
             style={{ writingMode: 'vertical-rl' }}
           >
             目录 →
@@ -64,10 +64,10 @@ export function TableOfContents({ headings }: { headings: HeadingItem[] }) {
         ) : (
           <div>
             <div className="flex items-center justify-between mb-3">
-              <span className="text-xs font-bold text-[rgb(var(--color-muted))] tracking-wider uppercase">目录</span>
+              <span className="text-xs font-bold text-warm-muted tracking-wider uppercase">目录</span>
               <button
                 onClick={toggle}
-                className="text-xs text-[rgb(var(--color-muted))] hover:text-[rgb(var(--color-heading))]"
+                className="text-xs text-warm-muted hover:text-warm-heading"
               >
                 收起 ←
               </button>
@@ -81,8 +81,8 @@ export function TableOfContents({ headings }: { headings: HeadingItem[] }) {
                     item.level === 3 ? 'pl-3' : ''
                   } ${
                     activeId === item.id
-                      ? 'text-[rgb(var(--color-heading))] font-medium'
-                      : 'text-[rgb(var(--color-muted))] hover:text-[rgb(var(--color-heading))]'
+                      ? 'text-warm-heading font-medium'
+                      : 'text-warm-muted hover:text-warm-heading'
                   }`}
                 >
                   {item.text}
@@ -97,12 +97,12 @@ export function TableOfContents({ headings }: { headings: HeadingItem[] }) {
       <div className="lg:hidden mb-6">
         <button
           onClick={toggle}
-          className="text-sm text-[rgb(var(--color-muted))] hover:text-[rgb(var(--color-heading))] flex items-center gap-1"
+          className="text-sm text-warm-muted hover:text-warm-heading flex items-center gap-1"
         >
           {collapsed ? '☰ 目录' : '✕ 收起目录'}
         </button>
         {!collapsed && (
-          <nav className="mt-3 p-4 bg-[rgb(var(--color-surface))] rounded-lg text-sm space-y-1">
+          <nav className="mt-3 p-4 bg-warm-surface rounded-lg text-sm space-y-1">
             {headings.map(item => (
               <a
                 key={item.id}
@@ -110,8 +110,8 @@ export function TableOfContents({ headings }: { headings: HeadingItem[] }) {
                 onClick={() => setCollapsed(true)}
                 className={`block py-1 ${item.level === 3 ? 'pl-3 text-xs' : ''} ${
                   activeId === item.id
-                    ? 'text-[rgb(var(--color-heading))] font-medium'
-                    : 'text-[rgb(var(--color-muted))]'
+                    ? 'text-warm-heading font-medium'
+                    : 'text-warm-muted'
                 }`}
               >
                 {item.text}

@@ -4,7 +4,7 @@ import type { PostMeta } from '@/lib/posts'
 export function PostCardGrid({ posts }: { posts: PostMeta[] }) {
   if (posts.length === 0) {
     return (
-      <div className="text-center py-16 text-[rgb(var(--color-muted))]">
+      <div className="text-center py-16 text-warm-muted">
         <p className="text-lg">No posts yet</p>
       </div>
     )

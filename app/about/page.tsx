@@ -7,7 +7,7 @@ export const metadata: Metadata = {
 export default function AboutPage() {
   return (
     <div className="max-w-reading mx-auto px-4 py-12">
-      <h1 className="text-3xl font-bold font-serif text-[rgb(var(--color-heading))] mb-8">
+      <h1 className="text-3xl font-bold font-serif text-warm-heading mb-8">
         About Me
       </h1>
 
