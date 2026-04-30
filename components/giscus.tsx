@@ -15,9 +15,9 @@ export function Giscus() {
     script.src = 'https://giscus.app/client.js'
     script.async = true
     script.setAttribute('data-repo', 'cuixiaojun001/blog')
-    script.setAttribute('data-repo-id', 'R_kgDOOXXXXX')
-    script.setAttribute('data-category', 'Comments')
-    script.setAttribute('data-category-id', 'DIC_kwDOOXXXXX')
+    script.setAttribute('data-repo-id', 'R_kgDOSQqa9g')
+    script.setAttribute('data-category', 'Announcements')
+    script.setAttribute('data-category-id', 'DIC_kwDOSQqa9s4C8CeC')
     script.setAttribute('data-mapping', 'pathname')
     script.setAttribute('data-strict', '0')
     script.setAttribute('data-reactions-enabled', '1')
