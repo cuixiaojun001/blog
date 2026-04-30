@@ -10,7 +10,7 @@ export function ThemeToggle() {
 
   useEffect(() => setMounted(true), [])
 
-  if (!mounted) return <div className="w-9 h-9" />
+  if (!mounted) return <div className="w-9 h-9" aria-hidden="true" />
 
   return (
     <button

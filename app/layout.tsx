@@ -12,6 +12,11 @@ export const metadata: Metadata = {
   description: 'Personal blog about tech and life.',
 }
 
+export const viewport = {
+  width: 'device-width',
+  initialScale: 1,
+}
+
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="zh-CN" suppressHydrationWarning>

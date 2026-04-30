@@ -30,7 +30,7 @@ export function Header() {
               key={l.href}
               href={l.href}
               className={`transition-colors ${
-                pathname === l.href
+                (l.href === '/' ? pathname === '/' : pathname.startsWith(l.href))
                   ? 'text-[rgb(var(--color-heading))] font-medium'
                   : 'text-[rgb(var(--color-muted))] hover:text-[rgb(var(--color-heading))]'
               }`}
@@ -56,6 +56,7 @@ export function Header() {
           className="sm:hidden p-2 text-[rgb(var(--color-muted))]"
           onClick={() => setOpen(!open)}
           aria-label="Toggle menu"
+          aria-expanded={open}
         >
           <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             {open ? (
