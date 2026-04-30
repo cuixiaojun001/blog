@@ -1,0 +1,100 @@
+/* app/globals.css */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --color-bg: 250 248 245;
+    --color-surface: 245 239 229;
+    --color-border: 232 224 213;
+    --color-muted: 155 140 124;
+    --color-text: 92 79 61;
+    --color-heading: 61 50 38;
+    --color-accent: 196 169 125;
+    --color-tag: 239 232 219;
+    --color-tag-text: 107 92 71;
+  }
+
+  .dark {
+    --color-bg: 15 17 23;
+    --color-surface: 24 27 35;
+    --color-border: 42 45 53;
+    --color-muted: 139 143 163;
+    --color-text: 201 205 214;
+    --color-heading: 240 240 240;
+    --color-accent: 196 169 125;
+    --color-tag: 30 33 48;
+    --color-tag-text: 160 168 192;
+  }
+
+  body {
+    @apply bg-[rgb(var(--color-bg))] text-[rgb(var(--color-text))];
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    @apply text-[rgb(var(--color-heading))] font-serif;
+  }
+
+  /* Article content styles */
+  .prose-warm {
+    @apply text-[rgb(var(--color-text))] leading-relaxed;
+    font-size: 1.0625rem;
+  }
+
+  .prose-warm p {
+    margin-bottom: 1.25rem;
+    line-height: 1.85;
+  }
+
+  .prose-warm h2 {
+    font-size: 1.5rem;
+    font-weight: 700;
+    margin-top: 2.5rem;
+    margin-bottom: 1rem;
+  }
+
+  .prose-warm h3 {
+    font-size: 1.25rem;
+    font-weight: 600;
+    margin-top: 2rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .prose-warm a {
+    @apply text-[rgb(var(--color-accent))] underline underline-offset-2;
+  }
+
+  .prose-warm code {
+    @apply bg-[rgb(var(--color-tag))] text-[rgb(var(--color-tag-text))] px-1.5 py-0.5 rounded text-sm;
+    font-size: 0.9em;
+  }
+
+  .prose-warm pre {
+    @apply bg-[rgb(var(--color-surface))] p-4 rounded-lg overflow-x-auto my-6;
+  }
+
+  .prose-warm pre code {
+    @apply bg-transparent p-0;
+  }
+
+  .prose-warm blockquote {
+    @apply border-l-4 border-[rgb(var(--color-accent))] pl-4 my-6 italic text-[rgb(var(--color-muted))];
+    background: rgb(var(--color-surface));
+    padding: 1rem 1.25rem;
+    border-radius: 0 4px 4px 0;
+  }
+
+  .prose-warm ul, .prose-warm ol {
+    margin-bottom: 1.25rem;
+    padding-left: 1.5rem;
+  }
+
+  .prose-warm li {
+    margin-bottom: 0.5rem;
+  }
+
+  .prose-warm img {
+    @apply rounded-lg my-6 max-w-full;
+  }
+}
