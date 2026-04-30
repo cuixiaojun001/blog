@@ -25,7 +25,7 @@ export function Giscus() {
     script.setAttribute('data-input-position', 'bottom')
     script.setAttribute('data-theme', resolvedTheme === 'dark' ? 'dark' : 'light')
     script.setAttribute('data-lang', 'zh-CN')
-    script.setAttribute('crossorigin', 'anonymous')
+    // crossorigin removed — causes CORS issues with GitHub API proxy
 
     ref.current.appendChild(script)
   }, [resolvedTheme])
