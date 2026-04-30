@@ -2,14 +2,15 @@ import type { Metadata } from 'next'
 import { ThemeProvider } from '@/components/theme-provider'
 import { Header } from '@/components/header'
 import { Footer } from '@/components/footer'
+import { SITE_NAME, SITE_DESCRIPTION } from '@/lib/constants'
 import './globals.css'
 
 export const metadata: Metadata = {
   title: {
-    default: 'Your Blog',
-    template: '%s | Your Blog',
+    default: SITE_NAME,
+    template: `%s | ${SITE_NAME}`,
   },
-  description: 'Personal blog about tech and life.',
+  description: SITE_DESCRIPTION,
 }
 
 export const viewport = {

@@ -1,10 +1,10 @@
-// components/header.tsx
 'use client'
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { ThemeToggle } from './theme-toggle'
 import { useState } from 'react'
+import { SITE_NAME } from '@/lib/constants'
 
 const links = [
   { href: '/', label: 'Posts' },
@@ -18,12 +18,11 @@ export function Header() {
 
   return (
     <header className="border-b border-warm-border">
-      <div className="max-w-4xl mx-auto px-4 h-16 flex items-center justify-between">
+      <div className="max-w-5xl mx-auto px-6 h-16 flex items-center justify-between">
         <Link href="/" className="font-serif font-bold text-xl text-warm-heading">
-          Your Blog
+          {SITE_NAME}
         </Link>
 
-        {/* Desktop nav */}
         <nav className="hidden sm:flex items-center gap-6 text-sm">
           {links.map(l => (
             <Link
@@ -51,7 +50,6 @@ export function Header() {
           <ThemeToggle />
         </nav>
 
-        {/* Mobile hamburger */}
         <button
           className="sm:hidden p-2 text-warm-muted"
           onClick={() => setOpen(!open)}
@@ -68,9 +66,8 @@ export function Header() {
         </button>
       </div>
 
-      {/* Mobile menu */}
       {open && (
-        <div className="sm:hidden border-t border-warm-border px-4 py-4 space-y-3">
+        <div className="sm:hidden border-t border-warm-border px-6 py-4 space-y-3">
           {links.map(l => (
             <Link
               key={l.href}

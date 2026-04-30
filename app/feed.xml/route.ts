@@ -1,14 +1,14 @@
 import { getAllPosts } from '@/lib/posts'
+import { SITE_NAME, SITE_DESCRIPTION, SITE_URL } from '@/lib/constants'
 
 export async function GET() {
   const posts = getAllPosts()
-  const siteUrl = 'https://yourblog.vercel.app'
 
   const items = posts.map(post => `
     <item>
       <title><![CDATA[${post.title}]]></title>
-      <link>${siteUrl}/posts/${post.slug}</link>
-      <guid isPermaLink="true">${siteUrl}/posts/${post.slug}</guid>
+      <link>${SITE_URL}/posts/${post.slug}</link>
+      <guid isPermaLink="true">${SITE_URL}/posts/${post.slug}</guid>
       <pubDate>${new Date(post.date).toUTCString()}</pubDate>
       <description><![CDATA[${post.excerpt || post.title}]]></description>
       ${post.tags.map(t => `<category>${t}</category>`).join('\n      ')}
@@ -17,12 +17,12 @@ export async function GET() {
   const rss = `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
   <channel>
-    <title>Your Blog</title>
-    <link>${siteUrl}</link>
-    <description>Personal blog about tech and life</description>
+    <title>${SITE_NAME}</title>
+    <link>${SITE_URL}</link>
+    <description>${SITE_DESCRIPTION}</description>
     <language>zh-CN</language>
     <lastBuildDate>${new Date().toUTCString()}</lastBuildDate>
-    <atom:link href="${siteUrl}/feed.xml" rel="self" type="application/rss+xml"/>
+    <atom:link href="${SITE_URL}/feed.xml" rel="self" type="application/rss+xml"/>
     ${items}
   </channel>
 </rss>`

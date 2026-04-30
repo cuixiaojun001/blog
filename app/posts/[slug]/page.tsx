@@ -46,7 +46,7 @@ export default async function PostPage({ params }: Props) {
   const headings = extractHeadings(post.content)
 
   return (
-    <div className="max-w-4xl mx-auto px-4 py-8">
+    <div className="max-w-5xl mx-auto px-6 py-8">
       <article>
         <header className="mb-8">
           <div className="text-sm text-warm-muted mb-2">

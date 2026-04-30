@@ -23,7 +23,7 @@ export default async function TagPage({ params }: Props) {
   const posts = getPostsByTag(tag)
 
   return (
-    <div className="max-w-4xl mx-auto px-4 py-12">
+    <div className="max-w-5xl mx-auto px-6 py-12">
       <header className="mb-8">
         <Link href="/tags" className="text-sm text-warm-muted hover:text-warm-heading">
           ← All tags
