@@ -1,24 +1,23 @@
 'use client'
 
-import GiscusComponent from '@giscus/react'
-import { useTheme } from 'next-themes'
+import { useEffect, useRef } from 'react'
 
 export function Giscus() {
-  const { resolvedTheme } = useTheme()
+  const ref = useRef<HTMLDivElement>(null)
 
-  return (
-    <GiscusComponent
-      repo="cuixiaojun001/blog"
-      repoId="R_kgDOSQqa9g"
-      category="Comments"
-      categoryId="DIC_kwDOSQqa9s4C8CiB"
-      mapping="pathname"
-      strict="0"
-      reactionsEnabled="1"
-      emitMetadata="0"
-      inputPosition="bottom"
-      theme={resolvedTheme === 'dark' ? 'dark' : 'light'}
-      lang="zh-CN"
-    />
-  )
+  useEffect(() => {
+    if (!ref.current || ref.current.hasChildNodes()) return
+
+    const script = document.createElement('script')
+    script.src = 'https://utteranc.es/client.js'
+    script.async = true
+    script.setAttribute('repo', 'cuixiaojun001/blog')
+    script.setAttribute('issue-term', 'pathname')
+    script.setAttribute('theme', 'preferred-color-scheme')
+    script.setAttribute('crossorigin', 'anonymous')
+
+    ref.current.appendChild(script)
+  }, [])
+
+  return <div ref={ref} />
 }

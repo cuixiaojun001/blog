@@ -1,0 +1,416 @@
+---
+title: "企业内基于 Sealos Cloud 开源组件实现 DevBox"
+date: "2026-05-11"
+tags: ["Sealos", "DevBox", "Kubernetes", "Cloud IDE"]
+category: "tech"
+excerpt: "基于 Sealos Cloud 的 DevBox 开源组件，在自有 Kubernetes 集群中搭建云端开发环境平台，实现开发环境的一致性、快速创建与销毁。"
+---
+
+## 背景
+
+在微服务和云原生的开发模式中，每个开发者都需要在本地搭建一套完整的环境：Go 编译器、Node.js、Python、各种中间件依赖……新同事入职第一周往往就耗费在环境搭建上。更严重的问题是"在我机器上能跑"——环境差异导致的低效沟通，每个团队都深有体会。
+
+Sealos Cloud 提供了一个叫做 **DevBox** 的云开发环境功能：用户在浏览器中就能获得一个完整的云端开发容器，通过 SSH 直连，环境即用即创建，用完即销毁。它本质上是 Kubernetes 上的 CRD Controller + SSH Gateway 的组合，所有代码都在 [github.com/labring/sealos](https://github.com/labring/sealos) 开源。
+
+本文介绍如何基于 Sealos Cloud 的开源组件，在企业内部的 Kubernetes 集群上独立部署 DevBox 服务。
+
+## DevBox 是什么
+
+DevBox 的核心思路很简单：**把开发环境定义成一个 Kubernetes 自定义资源（CRD）**。用户描述自己想要的开发环境——用什么镜像、多大规格——Controller 负责把描述变成运行中的 Pod，SSH Gateway 负责把用户安全地送进这个 Pod。
+
+核心组件只有三个：
+
+- **DevBox Controller** — 一个 Operator，监听 Devbox CR 的创建/更新/删除，同步 Secret（密钥对、JWT Secret）、Service、ConfigMap，最终管理 Pod 的完整生命周期。
+- **SSH Gateway** — DaemonSet 形式运行的 SSH 代理节点，是用户连接到 DevBox Pod 的**单一入口**。它以 `hostNetwork` 模式运行，监听节点的 2222 端口。
+- **DevBox 基础镜像** — 预装了 SSH Server、各种常用开发工具的基础容器镜像。Controller 会根据用户在 CR 中指定的 `image` 来创建 Pod。
+
+## 架构概览
+
+整个架构的请求链路如下：
+
+```
+用户 (私钥)
+  │
+  ▼
+CLB (LoadBalancer VIP，端口 2222)
+  │
+  ▼
+SSH Gateway Pod (:2222)
+  │ ├─ 第1段认证：用用户公钥查找 Registry，确定目标 DevBox Pod IP
+  │ └─ 第2段认证：用 DevBox 私钥连接 Pod
+  │
+  ▼
+DevBox Pod (:22)
+   └─ sshd：用 authorized_keys（= 公钥）验证
+```
+
+### 两段 SSH 认证
+
+这是一个关键设计。SSH Gateway 不直接将用户流量转发到 Pod，而是做两段式代理：
+
+1. **用户 → Gateway**：用户使用自己的私钥认证。Gateway 根据公钥（从用户 SSH 握手消息中提取）去 **Registry**（内存中的 Pod IP 映射表）查找对应的 DevBox。Registry 的数据由 Informer 实时同步自 Kubernetes 的 Secret 和 Pod 资源。
+2. **Gateway → Pod**：Gateway 找到目标 Pod IP 后，使用存储在 K8s Secret 中的 **DevBox 私钥**（`SEALOS_DEVBOX_PRIVATE_KEY`）连接 Pod 的 sshd。Pod 内的 `authorized_keys` 文件挂载了对应的公钥，sshd 验证通过。
+
+这样做的好处是：用户始终只持有自己的私钥，无需知道目标 Pod 的具体 IP；Gateway 作为反向代理统一管理路由和安全策略。
+
+### Secret 字段说明
+
+Controller 自动为每个 DevBox 创建一个同名 Secret，包含以下字段：
+
+| 字段 | 用途 | 挂载到 Pod |
+|------|------|-----------|
+| `SEALOS_DEVBOX_PUBLIC_KEY` | DevBox 公钥 | 被写入 `authorized_keys` 挂载到 Pod |
+| `SEALOS_DEVBOX_PRIVATE_KEY` | DevBox 私钥 | **不挂载**，由 Gateway 读取使用 |
+| `SEALOS_DEVBOX_AUTHORIZED_KEYS` | 用户公钥列表 | 挂载到 Pod 的 authorized_keys，初始与 PUBLIC_KEY 相同 |
+| `SEALOS_DEVBOX_JWT_SECRET` | JWT 签名密钥 | 通过环境变量注入 Pod |
+| `SEALOS_DEVBOX_ENV_PROFILE` | 环境配置文件 | 挂载到 Pod 的 profile 文件 |
+
+其中 `PRIVATE_KEY` 和 `PUBLIC_KEY` 是一对密钥，由 Controller 在创建 Secret 时通过 `helper.GenerateSSHKeyPair()` 自动生成。用户可以通过自定义 Controller 逻辑，将团队成员的 SSH 公钥追加到 `SEALOS_DEVBOX_AUTHORIZED_KEYS` 字段，实现多用户访问。
+
+## 部署操作手册
+
+以下步骤基于一个已有的 Kubernetes 集群（我们使用火山引擎 VKE），内部镜像仓库使用 Harbor。
+
+### 前置条件
+
+- Kubernetes 1.24+ 集群
+- `kubectl` 已配置集群访问凭证
+- Harbor 镜像仓库（或其他私有镜像仓库）
+- 基础开发镜像（如 `devbox/go:1.22`），预装 sshd 和常用工具
+
+### 步骤 1：构建并推送 Controller 镜像
+
+Controller 代码在 `controllers/devbox/` 目录下，使用 Dockerfile 构建：
+
+```bash
+# 在 sealos 仓库根目录
+cd controllers/devbox
+
+# 构建镜像（替换为你的 Harbor 地址）
+docker build -t harbor.intra.ke.com/infra/devbox/devbox-controller:v0.0.2 -f Dockerfile .
+
+# 推送
+docker push harbor.intra.ke.com/infra/devbox/devbox-controller:v0.0.2
+```
+
+关键命令行参数：
+
+- `--disable-commit=true`：企业自建时**推荐开启**。该选项跳过 registry login、containerd 连接，以及所有 commit 相关特性。如果不需要将 DevBox 中的改动提交为镜像，开启此选项可以大幅减少对集群节点配置的要求（不需要 containerd 额外权限）。
+- `--registry-addr`：如果需要 commit 功能，配置镜像仓库地址。
+- `--disable-commit=false`（默认值）：开启 commit 功能，Controller 会在 Pod 状态变化时自动将 DevBox 的内容提交为新镜像。
+
+### 步骤 2：部署 Controller
+
+使用 `kubectl` 部署。需要准备一份 deploy YAML，包含 CRD、Namespace、ServiceAccount、ClusterRole、Deployment 等资源。
+
+```yaml
+# deploy.yaml（简化示例）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devbox-controller-manager
+  namespace: devbox-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+  template:
+    metadata:
+      labels:
+        control-plane: controller-manager
+    spec:
+      serviceAccountName: devbox-controller-manager
+      containers:
+      - name: manager
+        image: harbor.intra.ke.com/infra/devbox/devbox-controller:v0.0.2
+        args:
+        - --leader-elect=false
+        - --disable-commit=true
+        - --health-probe-bind-address=:8081
+        - --metrics-bind-address=:8443
+        - --metrics-secure=true
+```
+
+> 注意：控制器设置了 `--leader-elect=false`，这是企业内多副本时推荐的做法。Sealos 团队的设计中 Controller 是**每个节点一个**（通过 NodeSelector 实现 DevBox Pod 和 Controller 同节点调度），因此不需要 leader election。
+
+### 步骤 3：部署 SSH Gateway
+
+SSH Gateway 以 DaemonSet 部署在集群的每个节点上：
+
+```yaml
+# sshgate-daemonset.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sshgate
+  namespace: devbox-system
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sshgate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sshgate
+    spec:
+      serviceAccountName: sshgate
+      hostNetwork: true  # 关键：使用主机网络
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: sshgate
+        image: harbor.intra.ke.com/infra/devbox/sshgate:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: ssh
+          containerPort: 2222
+          hostPort: 2222
+          protocol: TCP
+        envFrom:
+        - configMapRef:
+            name: sshgate
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sshgate
+  namespace: devbox-system
+data:
+  ENABLE_PROXY_PROTOCOL: "false"
+  SSH_HOST_KEY_SEED: "your-seed-string"
+  SSH_LISTEN_ADDR: ":2222"
+---
+# RBAC 权限：Gateway 需要读取 Secret 和 Pod
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sshgate
+rules:
+- apiGroups: [""]
+  resources: ["secrets", "pods"]
+  verbs: ["get", "list", "watch"]
+```
+
+`SSH_HOST_KEY_SEED` 是 Gateway 的 host key 种子，同一集群中所有 Gateway 实例使用相同的种子，确保用户连接时不会因为后端切换而看到 host key 变更警告。
+
+Gateway 使用 `hostNetwork: true` 直接监听宿主机 2222 端口。这样做的好处是 CLB 可以直接把流量分发到节点 IP + 2222 端口，不需要额外的 Service 层转发。
+
+### 步骤 4：创建 RuntimeClass
+
+如果容器运行时使用的不是 containerd，或者需要为 DevBox Pod 指定特殊的运行时配置，需要创建 RuntimeClass：
+
+```yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: devbox-runc
+handler: runc  # 或者你集群使用的运行时 handler
+```
+
+DevBox Pod 会在 spec 中通过 `runtimeClassName: devbox-runc` 引用这个 RuntimeClass。如果不使用自定义 RuntimeClass，可以在 Devbox CR 中不设置 `runtimeClassName`。
+
+### 步骤 5：创建 CLB Service
+
+对外暴露 SSH Gateway 的服务。我们使用火山引擎 VKE 的 LoadBalancer 注解来创建内网 CLB：
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: sshgate-lb
+  namespace: devbox-system
+  annotations:
+    service.beta.kubernetes.io/volcengine-loadbalancer-subnet-id: "subnet-xxxxxxxxxxxx"
+    service.beta.kubernetes.io/volcengine-loadbalancer-address-type: "PRIVATE"
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: sshgate
+  ports:
+  - port: 2222
+    targetPort: 2222
+    protocol: TCP
+```
+
+> **注意**：不要添加 `pass-through: "true"` 注解。pass-through 模式下 CLB 不会做 SNAT，后端包源 IP 是用户 IP，但我们的测试中发现该模式会导致端口不可达。留空即使用默认的 FullNAT 模式。
+
+其他云厂商的 LB 注解各不相同，核心思路一样：创建一个 Layer 4 TCP LoadBalancer，后端指向所有 Gateway 节点的 2222 端口。
+
+### 步骤 6：验证部署
+
+```bash
+# 检查 Controller Pod
+kubectl get pod -n devbox-system -l control-plane=controller-manager
+
+# 检查 SSH Gateway 是否在所有节点上运行
+kubectl get pod -n devbox-system -l app.kubernetes.io/name=sshgate -o wide
+
+# 查看 CLB VIP
+kubectl get svc sshgate-lb -n devbox-system
+```
+
+CLB VIP（如 `10.238.134.117`）即为 DevBox 服务的统一入口。
+
+## 创建第一个 DevBox
+
+### 1. 编写 Devbox CR
+
+```yaml
+apiVersion: devbox.sealos.io/v1alpha2
+kind: Devbox
+metadata:
+  name: my-devbox
+  namespace: devbox-test
+spec:
+  state: Running
+  image: harbor.intra.ke.com/infra/devbox/go:1.22
+  network:
+    type: SSHGate
+  resource:
+    cpu: "4"
+    memory: 8Gi
+  config:
+    user: devbox
+    workingDir: /home/devbox/project
+    ports:
+    - name: devbox-ssh-port
+      containerPort: 22
+      protocol: TCP
+```
+
+```bash
+kubectl create namespace devbox-test
+kubectl apply -f devbox.yaml
+```
+
+### 2. 等待 Pod 就绪
+
+```bash
+kubectl wait --for=condition=Ready pod/my-devbox -n devbox-test --timeout=120s
+kubectl get pod my-devbox -n devbox-test -o wide
+```
+
+Controller 会协调创建以下资源：
+
+```
+secret/my-devbox          → SSH 密钥对、JWT Secret、Env Profile
+configmap/my-devbox       → startup.sh（如果配置了 startup ConfigMap）
+svc/hedgehog-wonder-cnza  → Headless Service（用于网络标识）
+pod/my-devbox             → 实际的开发容器
+```
+
+`hedgehog-wonder-cnza` 这种随机名称来自 Controller 状态中的 `UniqueID`，用于内部网络标识。
+
+### 3. 导出私钥
+
+Controller 自动生成的私钥存在 Secret 中：
+
+```bash
+kubectl get secret my-devbox -n devbox-test \
+  -o jsonpath='{.data.SEALOS_DEVBOX_PRIVATE_KEY}' | base64 -d > ~/my-devbox-key
+chmod 600 ~/my-devbox-key
+```
+
+### 4. SSH 连接
+
+通过 CLB VIP 统一入口连接。SSH Gateway 靠用户的公钥识别目标 Pod，不依赖用户名：
+
+```bash
+ssh -i ~/my-devbox-key devbox@10.238.134.117 -p 2222
+```
+
+连接成功后，你就进入了云端开发容器。安装依赖、编译代码、运行服务——跟本地开发完全一样。
+
+## SSH Gateway 认证原理深入
+
+### 为什么需要两把私钥
+
+整个认证流程涉及**两个密钥对**：
+
+1. **用户密钥对**（在用户本地）：用户用自己的私钥向 Gateway 证明身份。Gateway 从 SSH 握手消息中提取用户的公钥指纹，去 Registry 路由表中查找对应的 DevBox。
+2. **DevBox 密钥对**（在 K8s Secret 中）：Gateway 用这个私钥去连接 Pod。Pod 内的 sshd 用 `authorized_keys` 来验证这个私钥对应的公钥。
+
+为什么不能只用一把？因为这是两个不同的安全域——用户域和集群域。用户的私钥不应该进入集群网络，而 DevBox 的私钥是集群内部的安全凭证。两段式设计让 Gateway 成为安全边界：外部认证用用户凭据，内部路由用集群凭据。
+
+### Registry 路由映射机制
+
+Gateway 内部维护着一个路由表 Registry，本质上是 `map[公钥指纹]→PodIP`。这个表通过 **K8s Informer** 实时同步：
+
+- Watch `Secrets`，提取 `SEALOS_DEVBOX_AUTHORIZED_KEYS` 字段，建立公钥 → DevBox 名称的映射。
+- Watch `Pods`，提取 Pod IP 和标签，建立 DevBox 名称 → Pod IP 的映射。
+
+当用户 SSH 连接 Gateway 时，Gateway 完成 SSH 握手后提取用户的公钥，查 Registry 找到目标 Pod IP，然后用 DevBox 私钥发起第二段 SSH 连接。
+
+这两段连接之间，用户的 SSH session 元数据被转发到目标 Pod，所以用户在 Pod 内 `whoami`、`last` 等命令看到的是原始连接信息。
+
+### Informer 的实时性
+
+Informer 使用的是 `LIST + WATCH` 模式，Watch 事件延迟通常在秒级。这意味着 DevBox Pod 启动后几秒钟内，Gateway 就能感知到并将路由信息注册到 Registry。用户不需要关心 Pod IP 是什么，只管用公钥连接即可。
+
+## 排障经验
+
+在实践中遇到了一些值得记录的问题：
+
+### defaultMode 384 vs 420（sshd 降权导致 Permission denied）
+
+在手动创建 Pod 且不通过 DevBox Controller 时，Secret Volume 的 `defaultMode` 配置至关重要：
+
+```yaml
+volumes:
+- name: ssh-auth
+  secret:
+    defaultMode: 420  # 不能是 384！
+    secretName: my-ssh-key
+```
+
+`defaultMode=384`（600 octal）在 `kubectl` 中看起来正确——只有文件所有者可读写。但问题在于 sshd 在验证公钥时会**降权到普通用户**运行，然后尝试读取 `authorized_keys`。由于 `384` 模式下非所有者的读取权限被禁止，sshd 会报 `Permission denied`。
+
+`420`（644 octal）允许所有用户读取，这就是 sshd 要求的权限。Controller 生成的 Pod 会自动设置为正确的 mode，但手动创建 Pod 时容易忽略这个细节。
+
+### CLB pass-through 导致端口不可达
+
+火山引擎 VKE 的 LoadBalancer Service 注解有 `pass-through` 模式，该模式下 CLB 不做 SNAT，后端看到的源 IP 是用户真实 IP。但测试发现，开启 pass-through 后端口根本无法建立 TCP 连接。
+
+原因推测是：pass-through 模式需要后端节点的路由表中有指向 CLB 的回程路由，而我们的子网配置并未包含这些路由。解决方法很简单——不启用 pass-through，CLB 默认的 FullNAT 模式功能正常。
+
+### 私钥不匹配
+
+如果 SSH 连接时遇到 `Permission denied (publickey)`，可能的原因：
+
+- **私钥拿到的是 DevBox 的而不是用户自己的**：`SEALOS_DEVBOX_PRIVATE_KEY` 是 Gateway 用来连接 Pod 的私钥，不是用户需要持有的私钥。用户的私钥在本地自行生成，公钥需要写入 `SEALOS_DEVBOX_AUTHORIZED_KEYS`。
+- **多用户共享 DevBox**：需要将每个用户公钥都追加到 `SEALOS_DEVBOX_AUTHORIZED_KEYS`。当前 Controller 的 `syncSecret` 逻辑只在创建 Secret 时设置 `SEALOS_DEVBOX_AUTHORIZED_KEYS = SEALOS_DEVBOX_PUBLIC_KEY`。如果需要在已有 DevBox 中添加其他用户的公钥，需要手动更新 Secret 或在 Controller 中扩展同步逻辑。
+
+## 与 Sealos Cloud 托管版对比
+
+| 维度 | Sealos Cloud 托管版 | 企业自建 |
+|------|-------------------|---------|
+| 部署维护 | 零运维，即开即用 | 需要运维团队维护 K8s 集群和组件 |
+| 镜像管理 | 内置镜像市场 | 需要自建 Harbor |
+| Commit 功能 | 完整支持 | 需要 containerd 连接和 registry 认证 |
+| 用户管理 | 对接 Sealos 账号系统 | 自行对接 LDAP/OIDC |
+| 网络 | 托管 CLB，自动配置域名 | 自行配置负载均衡器和 DNS |
+| 可用性 | Sealos 保障 | 自建 HA（多副本 Controller + DaemonSet） |
+| 成本 | 按量付费 | 只有基础设施成本 |
+
+企业自建 DevBox 的核心优势是**数据主权和定制能力**：你可以控制 DevBox 镜像的内容策略、SSH Gateway 的认证方式、网络隔离策略，甚至修改 Controller 代码来对接内部系统。
+
+## 总结与展望
+
+基于 Sealos Cloud 的开源组件搭建 DevBox，核心价值在于将"开发环境"这件事从个人机器上的手工操作，变成了 Kubernetes 上的声明式资源管理。创建、销毁、扩容开发环境变成了 `kubectl apply` 和 `kubectl delete` 的操作，环境的标准化和可追溯性有了根本保障。
+
+当前的方案还有一些局限性：
+
+- **Commit 功能需要节点级权限**：Controller 需要访问节点的 containerd 来挂载镜像层和提交新镜像，这要求 Controller 以特权模式运行或通过 sidecar 方式部署。目前 `--disable-commit` 是比较干净的选择。
+- **缺少 Web 终端**：Sealos Cloud 提供浏览器内的 Web Terminal，开源版目前依赖 SSH 客户端连接。
+- **用户管理未内置**：当前 Secret 中的 `authorized_keys` 需要自行维护，没有自动同步 LDAP/OIDC 的逻辑。
+- **Gateway 缺乏优雅的域名路由**：目前按公钥路由，对用户来说不够直观。未来可以扩展为按域名或按用户名的多租户路由。
+
+后续可以增强的方向：
+
+- 集成 Web Terminal（如 ttyd 或 WebSSH），提供浏览器访问
+- Dashboard GUI 管理 DevBox 生命周期
+- 对接企业 LDAP，自动同步 SSH 公钥
+- 开发环境快照与模板市场
+- DevBox 资源使用监控与成本分析
+
+Sealos DevBox 开源组件提供了一个不错的起点——它把开发环境管理的复杂逻辑（Operator 模式、SSH 代理路由、容器管理）都实现了，企业可以在此基础上做定制化扩展，构建适合自己团队的云开发平台。
