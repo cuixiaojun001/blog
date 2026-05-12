@@ -87,10 +87,10 @@ Controller 代码在 `controllers/devbox/` 目录下，使用 Dockerfile 构建�
 cd controllers/devbox
 
 # 构建镜像（替换为你的 Harbor 地址）
-docker build -t harbor.intra.ke.com/infra/devbox/devbox-controller:v0.0.2 -f Dockerfile .
+docker build -t registry.example.com/infra/devbox/devbox-controller:v0.0.2 -f Dockerfile .
 
 # 推送
-docker push harbor.intra.ke.com/infra/devbox/devbox-controller:v0.0.2
+docker push registry.example.com/infra/devbox/devbox-controller:v0.0.2
 ```
 
 关键命令行参数：
@@ -123,7 +123,7 @@ spec:
       serviceAccountName: devbox-controller-manager
       containers:
       - name: manager
-        image: harbor.intra.ke.com/infra/devbox/devbox-controller:v0.0.2
+        image: registry.example.com/infra/devbox/devbox-controller:v0.0.2
         args:
         - --leader-elect=false
         - --disable-commit=true
@@ -159,7 +159,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: sshgate
-        image: harbor.intra.ke.com/infra/devbox/sshgate:latest
+        image: registry.example.com/infra/devbox/sshgate:latest
         imagePullPolicy: IfNotPresent
         ports:
         - name: ssh
@@ -249,7 +249,7 @@ kubectl get pod -n devbox-system -l app.kubernetes.io/name=sshgate -o wide
 kubectl get svc sshgate-lb -n devbox-system
 ```
 
-CLB VIP（如 `10.238.134.117`）即为 DevBox 服务的统一入口。
+CLB VIP（如 `<CLB_VIP>`）即为 DevBox 服务的统一入口。
 
 ## 创建第一个 DevBox
 
@@ -263,7 +263,7 @@ metadata:
   namespace: devbox-test
 spec:
   state: Running
-  image: harbor.intra.ke.com/infra/devbox/go:1.22
+  image: registry.example.com/infra/devbox/go:1.22
   network:
     type: SSHGate
   resource:
@@ -316,7 +316,7 @@ chmod 600 ~/my-devbox-key
 通过 CLB VIP 统一入口连接。SSH Gateway 靠用户的公钥识别目标 Pod，不依赖用户名：
 
 ```bash
-ssh -i ~/my-devbox-key devbox@10.238.134.117 -p 2222
+ssh -i ~/my-devbox-key devbox@<CLB_VIP> -p 2222
 ```
 
 连接成功后，你就进入了云端开发容器。安装依赖、编译代码、运行服务——跟本地开发完全一样。
