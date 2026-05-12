@@ -430,9 +430,10 @@ code --install-extension devbox-enterprise-0.1.0.vsix
 | 问题 | 原因 | 解决 |
 |------|------|------|
 | 点击按钮无反应 | 扩展未安装 | `code --install-extension` 安装 .vsix |
+| `Permission denied (publickey)` | 私钥不匹配或格式损坏 | 检查私钥与 DevBox Secret 一致；确认私钥文件尾部有 `\n` |
+| `Load key: invalid format` | PEM 文件末尾缺少换行符 | `.trim()` 会去掉换行符，扩展 v0.1.0 已加防御性补 `\n` |
 | "Permissions are too open" | 私钥权限不是 600 | `chmod 600 ~/.ssh/devbox-enterprise/<name>` |
-| SSH 连接超时 | Gateway 不可达 | 检查 CLB VIP 是否能 ping 通 |
-| "Permission denied" | 私钥不匹配 | 确认私钥与 DevBox 的公钥是一对 |
+| SSH 连接超时 | Gateway 不可达 | 检查 CLB VIP 是否能 ping 通 || "Permission denied" | 私钥不匹配 | 确认私钥与 DevBox 的公钥是一对 |
 
 ## 未来规划
 
