@@ -1,0 +1,396 @@
+---
+title: "Serverless Sandbox 技术调研 —— 从 Coze 逆向分析到 CloudStudio 沙箱方案设计"
+date: "2026-05-13"
+tags: ["Kubernetes", "Kata Containers", "Serverless", "Cloud Native"]
+category: "tech"
+excerpt: "通过逆向分析 Coze 沙箱架构，探索 Serverless 沙箱作为 AI Agent 代码执行环境的可行性，并设计基于持久化 Upper Layer 的 CloudStudio 沙箱方案。"
+---
+
+> 调研日期：2026-05-13
+
+## 调研动机
+
+CloudStudio 当前基于 Sealos DevBox（Pod 模式）提供开发环境，每个用户分配一个常驻 K8s Pod。这种模式适合长时间开发，但对于以下场景存在不足：
+
+- **AI Agent 执行代码**：Agent 需要在隔离环境中运行用户代码，每次执行可能只需几分钟，不需要常驻 Pod
+- **轻量代码预览**：用户想快速运行一段代码看效果，不需要完整 IDE
+- **成本优化**：Pod 常驻占资源，如果用户只用几分钟就闲置，资源浪费严重
+
+我们调研了市场上类似的 Serverless 沙箱产品，重点关注**扣子编程（Coze）** 的实现方式。
+
+## Coze 沙箱架构逆向分析
+
+### 什么是 Coze
+
+[扣子编程（Coze）](https://www.coze.cn/) 是字节跳动推出的 AI 应用开发平台，用户可以在其沙箱环境中编写、运行和调试代码。沙箱环境提供完整的 Linux 运行时，支持 npm/pip 等包管理器。
+
+### 逆向方法
+
+通过在 Coze 沙箱内执行 `ps aux` 和 `df -h` 命令，观察进程列表和文件系统挂载信息，推断底层架构。
+
+### 发现的架构
+
+```
+进程列表关键信息:
+━━━━━━━━━━━━━━━━━━
+PID 1:    /sbin/init                              ← 容器 init 进程
+PID xx:   runtime-agent /opt/bytefaas/run.sh       ← ByteFaaS 运行时代理
+PID xx:   /usr/local/bin/s3fs /space ...           ← S3 FUSE 挂载
+PID xx:   /usr/local/bin/s3fs /skills/user ...     ← S3 FUSE 挂载
+
+文件系统挂载:
+━━━━━━━━━━━━━━━━━━
+Filesystem      Size    Mounted on
+kataShared      3.5T    /                  ← Kata Containers 共享存储作为 rootfs
+s3fs            64PB    /space             ← S3 对象存储 FUSE 挂载
+s3fs            64PB    /skills/user       ← S3 对象存储 FUSE 挂载
+```
+
+### 架构解读
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     Coze Sandbox 架构                             │
+│                                                                   │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │                 Guest VM (Kata 安全沙箱)                  │    │
+│  │                                                           │    │
+│  │  / (rootfs) ← kataShared 3.5T                            │    │
+│  │  │  ├── bin, usr, lib, etc...  系统文件                   │    │
+│  │  │  ├── home/                  用户主目录                  │    │
+│  │  │  └── ...                                                │    │
+│  │  │                                                        │    │
+│  │  /space ← s3fs               项目文件持久存储              │    │
+│  │  /skills/user ← s3fs         技能数据持久存储              │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│       │                              │                            │
+│    VirtioFS                     FUSE (s3fs)                       │
+│       │                              │                            │
+└───────┼──────────────────────────────┼────────────────────────────┘
+        │                              │
+┌───────┼──────────────────────────────┼────────────────────────────┐
+│  宿主机│                              │                            │
+│       ▼                              ▼                            │
+│  /mnt/sandbox-{id}            S3 兼容对象存储 (TOS)               │
+│  (云盘支撑)                    - /space bucket                    │
+│  virtiofsd 共享                - /skills bucket                   │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+### 关键发现：rootfs 不持久化
+
+**实测验证**：在 Coze 沙箱中通过 `npm install -g @anthropic-ai/claude-code` 安装 Claude Code，会在 `/root/.claude` 目录下生成配置文件。关闭项目后再次打开：
+
+- `/root/.claude` 目录**不存在** — npm 安装的内容全部丢失
+- `ps aux` 显示的进程 START 时间都是**当前时间** — 不是预热实例，而是全新容器
+- 仅 `/space` 和 `/skills/user` 下的数据保留 — 这两个目录由 s3fs 挂载，数据存在 S3 中
+
+**结论**：Coze 的 kataShared rootfs 是临时的，每次会话从基础镜像创建全新环境。只有 s3fs 挂载的指定目录才是持久化的。
+
+## 关键技术概念
+
+### Kata Containers
+
+**Kata Containers** 是一个 [CNCF 孵化项目](https://katacontainers.io/)，它将每个容器/Pod 运行在独立的轻量级虚拟机（VM）中，通过硬件虚拟化（Intel VT-x / AMD-V）提供强隔离，而非依赖 Linux namespace 和 cgroup 的共享内核模型。
+
+**为什么需要 Kata**：普通的 runc 容器（Docker 默认运行时）与宿主机共享同一个 Linux 内核。如果容器内进程利用内核漏洞逃逸，可能影响同一宿主机上的其他容器。Kata 通过给每个容器一个独立内核（VM），即使容器被攻破，攻击者也困在 VM 内，无法影响宿主机和其他容器。
+
+```
+runc 容器 (共享内核):
+┌─────────────────────────────────┐
+│          宿主机 Linux 内核        │
+│  ┌──────────┐  ┌──────────┐    │
+│  │ 容器 A    │  │ 容器 B    │    │
+│  │ (共享内核) │  │ (共享内核) │    │
+│  └──────────┘  └──────────┘    │
+│  风险: 容器 A 逃逸可能影响容器 B  │
+└─────────────────────────────────┘
+
+Kata 容器 (独立内核):
+┌─────────────────────────────────────────┐
+│          宿主机 Linux 内核                │
+│  ┌────────────────┐ ┌────────────────┐  │
+│  │  VM A           │ │  VM B           │  │
+│  │  ┌──────────┐  │ │  ┌──────────┐  │  │
+│  │  │ 容器 A    │  │ │  │ 容器 B    │  │  │
+│  │  │ (独立内核) │  │ │  │ (独立内核) │  │  │
+│  │  └──────────┘  │ │  └──────────┘  │  │
+│  └────────────────┘ └────────────────┘  │
+│  安全: VM 边界隔离，互不影响               │
+└─────────────────────────────────────────┘
+```
+
+**性能代价**：Kata 的启动比 runc 慢（~100-300ms vs ~1-5ms），每个 VM 额外占用 ~30-50MB 内存用于 Guest 内核。但在 Serverless 场景中，通过预热池可以弥补这个差距。
+
+### OverlayFS
+
+**OverlayFS** 是 [Linux 内核内置的联合文件系统](https://docs.kernel.org/filesystems/overlayfs.html)，它将多个目录"叠加"成一个统一的目录视图。Docker、containerd 等容器运行时都用它来构建容器的 rootfs（根文件系统）。
+
+OverlayFS 有三个核心概念：
+
+| 概念 | 作用 | 类比 |
+|------|------|------|
+| **lower dir** | 只读的基础层，可以有多个 | 印刷版的书（不可修改） |
+| **upper dir** | 可写层，所有修改写入这里 | 透明覆盖纸，在上面写字 |
+| **merged** | lower + upper 的合并视图 | 透过覆盖纸看到的完整内容 |
+
+```
+读取: 先查 upper → 没有 → 查 lower → 返回结果
+写入: 直接写入 upper（如果 lower 有同名文件，先复制到 upper 再修改，称为 "copy-up"）
+删除: 在 upper 创建 whiteout 文件（一种标记），遮盖 lower 中的对应文件
+
+         lower/              upper/              merged/
+         ┌─────────┐        ┌─────────┐        ┌─────────┐
+         │ bin/    │        │         │        │ bin/    │ ← 从 lower 读
+         │ usr/    │        │ usr/    │        │ usr/    │ ← lower + upper 合并
+         │   ├── python3 │  │   ├── local  │  │   ├── python3 │ ← lower
+         │ etc/   │        │   │  └── node │  │   ├── local  │ ← upper
+         │         │        │ etc/    │        │       └── node │ ← upper 提供
+         │         │        │ .wh.old-tool│     │ etc/    │ ← upper 覆盖
+         │         │        │         │        │ (old-tool 不存在) ← whiteout 遮盖
+         └─────────┘        └─────────┘        └─────────┘
+         只读                 可写                 容器看到的内容
+```
+
+> **whiteout**：一种特殊文件，用于标记删除。当在 upper 层创建 `.wh.filename` 文件时，OverlayFS 会认为 lower 层中的 `filename` 文件不存在，实现"删除"效果，但 lower 层的文件实际未被删除。
+
+> **copy-up**：当容器尝试修改 lower 层中的只读文件时，OverlayFS 会先将文件复制到 upper 层，然后修改 upper 层的副本。这个操作称为 copy-up。
+
+**容器运行时如何使用 OverlayFS**：当容器启动时，运行时将镜像的每一层作为 lower dir，创建一个空的 upper dir，然后将 merged 目录作为容器的根文件系统。容器内所有文件操作（安装包、修改配置、创建文件）都写入 upper dir。当容器被删除时，upper dir 也被清除——这就是为什么容器内的修改会丢失。
+
+### VirtioFS
+
+**VirtioFS** 是一种 [基于 Virtio 协议的共享文件系统](https://virtio-fs.gitlab.io/)，专为虚拟机场景设计，允许宿主机和 Guest VM 之间高效共享目录。它是 Kata Containers 推荐的文件共享方式，取代了旧版的 9pfs。
+
+**为什么 Kata 需要 VirtioFS**：在 runc 容器中，容器进程直接访问宿主机的 OverlayFS merged 目录（通过 chroot + namespace）。但在 Kata 中，容器运行在 VM 内，VM 和宿主机之间有硬件虚拟化边界，不能直接访问宿主机文件系统。VirtioFS 就是跨越这个边界的桥梁。
+
+```
+runc 容器 (直接访问):
+  容器进程 → chroot → 直接访问宿主机 OverlayFS merged 目录
+
+Kata 容器 (需要 VirtioFS):
+  宿主机:
+    OverlayFS merged 目录
+         │
+    virtiofsd 守护进程 (将目录通过 VirtioFS 协议暴露)
+         │
+    ═══════════════════ VM 边界 ═══════════════════
+         │
+    Guest VM:
+    VirtioFS 驱动 (Guest 内核模块)
+         │
+    挂载为 rootfs → 容器进程读写
+```
+
+**DAX 加速**：VirtioFS 支持 [DAX (Direct Access)](https://virtio-fs.gitlab.io/howto-qemu.html#shared-directory) 特性，允许 Guest VM 直接映射宿主机的内存页，绕过 virtio ring 传输，大幅提升读取性能。
+
+> **DAX (Direct Access)**：一种优化技术，允许虚拟机直接访问宿主机的内存映射文件，减少数据拷贝，提升 I/O 性能。
+
+### FUSE 与 s3fs
+
+**FUSE (Filesystem in Userspace)** 是 [Linux 内核提供的机制](https://www.kernel.org/doc/html/latest/filesystems/fuse.html)，允许普通用户态程序实现文件系统，无需修改内核代码。通过 FUSE 实现的文件系统在用户空间运行，内核通过 /dev/fuse 设备将文件操作请求传递给用户态程序。
+
+**s3fs** 是一个 [基于 FUSE 的 S3 文件系统客户端](https://github.com/s3fs-fuse/s3fs-fuse)，它将 S3 兼容的对象存储（如 AWS S3、阿里云 OSS、火山云 TOS）挂载为本地目录，像操作本地文件一样操作对象存储中的数据。
+
+```
+应用程序读写 /space/file.txt
+         │
+    ┌────▼─────┐
+    │  VFS     │  ← Linux 虚拟文件系统层
+    └────┬─────┘
+         │ FUSE (/dev/fuse)
+    ┌────▼─────┐
+    │  s3fs    │  ← 用户态进程，将文件操作转为 S3 API 调用
+    └────┬─────┘
+         │ HTTPS (S3 API)
+    ┌────▼─────┐
+    │  S3/TOS  │  ← 对象存储服务
+    └──────────┘
+
+特点:
+  - 优点: 天然持久化（数据在对象存储中，与 VM 生命周期无关），容量几乎无限
+  - 缺点: 性能较差（每次读写都要走网络 + S3 API），不适合频繁小文件操作
+```
+
+Coze 使用 s3fs 将 S3 对象存储挂载到 `/space` 和 `/skills/user`，实现了用户项目文件的持久化，且容量不受 VM 磁盘限制。
+
+### ByteFaaS
+
+**ByteFaaS** 是[字节跳动内部的 Function-as-a-Service 平台](https://www.volcengine.com/product/bytefaas)（已对外商业化），类似于 AWS Lambda。它提供 Serverless 函数运行时，支持事件触发、自动扩缩容、按调用量计费。
+
+> **Function-as-a-Service (FaaS)**：一种 Serverless 计算服务，用户只需上传函数代码，平台负责运行时的部署、扩缩容、高可用等所有运维工作，用户按实际调用次数和执行时间付费。
+
+Coze 的沙箱底层使用 ByteFaaS 作为运行时平台。`runtime-agent /opt/bytefaas/run.sh` 是 ByteFaaS 注入的代理进程，负责：
+
+- 接收平台的启动/停止指令
+- 上报沙箱的健康状态和指标
+- 在沙箱空闲超时后触发缩容
+
+### kataShared
+
+在 Coze 沙箱中 `df -h` 显示的 `kataShared 3.5T at /`，指的是 Kata Containers 通过 VirtioFS 将宿主机目录共享给 Guest VM，作为容器的根文件系统。`kataShared` 是这个 VirtioFS 共享的标签名，3.5T 是精简配置（thin provisioning）的容量上限，实际用量远小于此。
+
+> **thin provisioning（精简配置）**：一种存储技术，允许分配比实际物理容量更大的虚拟容量。系统只在数据真正写入时才分配物理空间，提高资源利用率。
+
+## DevBox vs Sandbox 成本对比
+
+### 假设条件
+
+一个用户，2C4G 开发环境，每天活跃使用 8 小时。
+
+| 维度 | DevBox (Pod) | Sandbox (Kata Serverless) |
+|------|---|---|
+| **运行时间** | 24h/天（常驻，或加自动休眠缩到 0.1C0.1G） | 仅活跃时运行（~8h/天） |
+| **计算成本** | 24h × 2C4G（无休眠）/ 8h 活跃 + 16h 休眠 | 8h × 2C4G + VM 额外开销 |
+| **VM 额外开销** | 无（runc 直接在宿主机运行） | ~50MB/VM 内存 + guest kernel + virtiofsd |
+| **预热池成本** | 不需要 | 需要维持空闲 VM 以保证 1-3s 启动 |
+| **存储** | PVC（本地 NVMe 或 Ceph），I/O 快 | 云盘 upper layer + 对象存储，I/O 慢 3-5x |
+| **冷启动** | 10-30s（创建 Pod + 挂 PVC） | 冷启动 5-10s / 热池 1-3s |
+| **热启动** | 0s（已在运行） | 1-3s（从预热池分配） |
+| **隔离性** | 共享内核（runc），低 | VM 级隔离，高 |
+
+> **PVC (Persistent Volume Claim)**：Kubernetes 中用于声明持久化存储的 API 对象。用户声明需要多少存储空间，K8s 会自动绑定合适的 Persistent Volume（如云盘、NFS、Ceph）。
+
+### 场景分析
+
+**场景 A：企业开发者，8-10h/天使用**
+
+- DevBox + 自动休眠：成本较低，I/O 快，体验好
+- Sandbox：VM 开销 + 云盘 I/O + 预热池 ≈ 抵消了省下的 16h 计算费
+- **结论**：DevBox 更优
+
+**场景 B：AI Agent 执行代码，每次 5-30 分钟**
+
+- DevBox：冷启动慢，PVC 挂载耗时，常驻浪费
+- Sandbox：预热池 1-3s 启动，用完即销毁，按秒计费
+- **结论**：Sandbox 更优
+
+## 持久化 Upper Layer 方案
+
+### 问题
+
+Coze 的 rootfs 不持久化，用户安装的包在会话结束后丢失。对于 CloudStudio 的开发者用户，这种体验不可接受——反复重装依赖会严重影响效率。
+
+### 方案：将 OverlayFS 的 upper dir 放到云盘 PVC
+
+普通 Kata 容器的 OverlayFS upper dir 在宿主机本地临时目录（如 `/run/kata/upper/`），Pod 销毁时被清理。如果将 upper dir 放到云盘 PVC 上，Pod 销毁后 PVC 保留，新 Pod 挂载同一 PVC 即可恢复所有用户修改。
+
+```
+首次创建 Sandbox:
+━━━━━━━━━━━━━━━━━━
+
+  1. K8s 调度器选择节点，创建 PVC: sandbox-upper-user-01
+     PVC 挂载到宿主机: /mnt/pvc/sandbox-upper-user-01/
+     初始内容: upper/ (空), work/ (空)
+
+  2. Init Container 搭建 OverlayFS:
+     lower = /var/lib/containerd/.../image-layers  (基础镜像，只读)
+     upper = /mnt/pvc/sandbox-upper-user-01/upper   (云盘 PVC，可写)
+     work  = /mnt/pvc/sandbox-upper-user-01/work    (OverlayFS 内部使用)
+     merged = /run/kata-custom/merged
+
+  3. virtiofsd 共享 merged 目录 → Kata Guest VM 的 rootfs
+
+  4. 用户在沙箱内: npm install, pip install, 修改配置...
+     → 所有写入进入 upper dir → 落到云盘 PVC
+
+
+Sandbox 缩容/销毁:
+━━━━━━━━━━━━━━━━━━
+
+  5. Kata VM 销毁
+  6. merged 视图消失（临时目录被清理）
+  7. ★ PVC 保留 → upper dir 数据完好
+  8. PVC 从宿主机 unmount
+
+
+Sandbox 再次激活:
+━━━━━━━━━━━━━━━━━━
+
+  9. K8s 调度器（可能不同节点），挂载同一 PVC
+  10. Init Container 搭建 OverlayFS:
+      same lower + same upper → same merged
+  11. Kata VM 启动 → 之前装的包、改的配置全部恢复
+```
+
+### 与 Coze 方案的对比
+
+| | Coze 方案 | CloudStudio 持久化 Upper Layer |
+|---|---|---|
+| rootfs 持久化 | 不持久化，每次全新 | 持久化，用户修改跨会话保留 |
+| 持久化机制 | 仅 s3fs 挂载指定目录 | OverlayFS upper dir 放云盘 PVC |
+| 用户感知 | 需要记住将文件存到 /space | 完全透明，装什么保留什么 |
+| 适用场景 | AI 代码运行（不需要装包） | 开发环境（需要装工具和依赖） |
+| 存储成本 | 仅对象存储 | 对象存储 + 云盘（~2-10GB/用户） |
+
+### 需要处理的边界问题
+
+| 问题 | 说明 | 解决方案 |
+|------|------|---------|
+| **镜像更新冲突** | 基础镜像更新后，lower 层变了，upper 中可能有与新 lower 冲突的文件 | 锁定基础镜像版本，不自动更新；需要更新时引导用户 Reset |
+| **跨节点调度** | Pod 第一次在 Node A，缩容后重新调度到 Node B，新节点可能没有镜像层 | PVC 使用 ReadWriteMany（Ceph/NFS 后端），或在所有 Kata 节点预拉取基础镜像 |
+| **Upper 层膨胀** | OverlayFS 删除文件只是创建 whiteout 标记，不释放空间；反复装删包导致 upper 只增不减 | 容量配额（PVC 上限 20GB）+ 定期压缩合并 + 用户 Reset 按钮 |
+| **I/O 性能** | 写入路径：App → VirtioFS → virtiofsd → OverlayFS → 云盘网络 I/O，比本地盘慢 | VirtioFS 开启 DAX 加速 + PVC 使用高性能 SSD 云盘 + 大文件走 JuiceFS |
+
+> **ReadWriteMany**：Kubernetes 中的一种访问模式，允许多个节点同时读写同一个存储卷。实现它需要底层存储系统支持（如 Ceph、NFS）。
+
+### K8s 实现方案（Sandbox CRD）
+
+```yaml
+# 自定义资源定义
+apiVersion: cloudstudio.io/v1alpha1
+kind: Sandbox
+metadata:
+  name: user-01-sandbox
+spec:
+  userId: user-01
+  image: cloudstudio-sandbox:v1.2.0    # 基础镜像（锁定版本）
+  resources:
+    cpu: "2"
+    memory: "4Gi"
+  storage:
+    upperLayerPVC: sandbox-upper-user-01  # 持久化 upper layer 的 PVC
+    upperLayerSize: 20Gi                   # 容量上限
+    workspacePVC: workspace-user-01        # 工作空间 PVC（对应 /workspace）
+    workspaceSize: 50Gi
+```
+
+> **CRD (Custom Resource Definition)**：Kubernetes 的扩展机制，允许用户定义自己的资源类型。Operator 监听这些自定义资源的变化，执行相应的业务逻辑。
+
+## 结论与建议
+
+### 当前决策
+
+**先继续 Pod 类型 DevBox 路线**，Sandbox 方案留作技术储备。
+
+理由：
+- CloudStudio 的核心用户是企业开发者，8h/天长时使用，DevBox 更适合
+- DevBox 加自动休眠（Pod 缩容到最小资源）已能覆盖大部分成本优化需求
+- Sandbox 的 AI Agent 场景尚未明确，过早投入可能走弯路
+
+### 产品矩阵（远期）
+
+```
+CloudStudio
+  │
+  ├── DevBox (Pod)                    ← 核心产品，当前实现
+  │   长时间开发 · IDE 全功能 · 本地盘 I/O 快
+  │   适合: 企业开发者日常开发
+  │
+  └── Sandbox (Kata Serverless)       ← 技术储备，后续实现
+      短时运行 · VM 级隔离 · 按秒计费
+      适合: AI Agent 执行 · 代码预览 · 安全沙箱
+```
+
+两者共享同一套构建 API、部署流水线、前端 UI 和 VS Code 扩展。
+
+## 参考资料
+
+- [Kata Containers 官方文档](https://katacontainers.io/docs/)
+- [Kata Containers GitHub](https://github.com/kata-containers/kata-containers)
+- [OverlayFS 内核文档](https://docs.kernel.org/filesystems/overlayfs.html)
+- [VirtioFS 项目](https://virtio-fs.gitlab.io/)
+- [FUSE 内核文档](https://www.kernel.org/doc/html/latest/filesystems/fuse.html)
+- [s3fs-fuse GitHub](https://github.com/s3fs-fuse/s3fs-fuse)
+- [ByteFaaS 火山云产品页](https://www.volcengine.com/product/bytefaas)
+- [Kubernetes Persistent Volumes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/)
