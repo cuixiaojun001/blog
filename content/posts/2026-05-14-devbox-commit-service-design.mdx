@@ -1,0 +1,741 @@
+---
+title: "DevBox Commit Service：零节点依赖的容器持久化方案"
+date: "2026-05-14"
+tags: ["Kubernetes", "containerd", "OverlayFS", "DevBox", "CloudStudio"]
+category: "tech"
+excerpt: "在火山云 VKE 集群中实现 DevBox 的 CommitImage 能力，无需安装任何节点级组件，仅使用 containerd 标准接口和 overlayfs snapshotter。"
+---
+
+## 背景故事：从 Sealos 到 VKE
+
+CloudStudio DevBox 基于 Sealos DevBox Controller 构建，其核心特性之一是 **CommitImage**——在 DevBox 关机时，将容器的可写层提交为新镜像并推送到 Registry，下次启动时使用该镜像作为 BaseImage，从而实现数据持久化。
+
+这个机制在 Sealos 自建集群中运行良好，但当我们迁移到火山云 VKE 托管集群时遇到了一个问题：**VKE 集群不是通过 Sealos CLI 创建的，无法安装 Sealos 依赖的节点级组件。**
+
+我们面临两个选择：
+1. 放弃 CommitImage 能力，寻找其他持久化方案
+2. 找到一种不依赖节点级组件的 CommitImage 实现
+
+经过深入分析，我们选择了方案 2，设计了一套基于 containerd 标准接口的零依赖 Commit Service。
+
+## 技术概念速览
+
+在深入方案之前，先介绍几个关键概念。
+
+### containerd Snapshotter
+
+**containerd Snapshotter** 是 containerd 中管理容器文件系统快照的组件接口。它的核心职责是处理容器镜像层的存储和挂载——当容器启动时，snapshotter 负责将镜像的只读层和可写层组合成一个完整的文件系统视图。
+
+containerd 支持多种 snapshotter 实现，常见的有：
+
+| Snapshotter | 特点 | 适用场景 |
+|-------------|------|---------|
+| **overlayfs** | containerd 默认内置，基于 Linux OverlayFS 联合文件系统 | 通用场景，无需额外安装 |
+| **devbox (overlaybd)** | Sealos 定制，基于 LVM 的块设备层，每层对应一个 Logical Volume | 需要精确存储配额和 LV 克隆 |
+| **stargz** | 支持 Lazy Pulling，镜像按需拉取 | 镜像层数多、冷启动敏感 |
+| **fuse-overlayfs** | 使用 FUSE 实现 overlayfs | 不支持原生 overlayfs 的场景 |
+
+> **联合文件系统 (Union Filesystem)**：一种文件系统类型，允许将多个目录"叠加"在一起，形成一个统一的目录视图。用户看到的合并内容来自所有叠加的目录，但只对上层目录有写权限。
+
+### OCI 镜像格式
+
+**OCI (Open Container Initiative) 镜像** 是容器镜像的标准化格式，由 Manifest、Image Config 和一系列 Layer 组成。Docker、containerd 等所有主流容器运行时都支持 OCI 格式。
+
+```bash
+# 一个典型的 OCI 镜像结构
+my-app:v1.0/
+├── manifest.json          # 描述镜像的层和配置
+├── config.json            # 容器运行时的配置（环境变量、入口点等）
+├── sha256:layer1.tar.gz   # 只读层 1（基础操作系统）
+├── sha256:layer2.tar.gz   # 只读层 2（运行时依赖）
+├── sha256:layer3.tar.gz   # 只读层 3（应用代码）
+└── sha256:layer4.tar.gz   # 可写层（用户修改，commit 时生成）
+```
+
+### overlayfs
+
+**overlayfs** 是 Linux 内核内置的联合文件系统实现。它有三个核心目录：
+
+| 目录 | 类型 | 作用 |
+|------|------|------|
+| **lower dir** | 只读 | 基础镜像层，可以有多个 |
+| **upper dir** | 可写 | 容器的可写层，所有修改写入这里 |
+| **work dir** | 辅助 | overlayfs 内部使用的临时目录 |
+| **merged** | 视图 | lower + upper 的合并结果，容器看到的 rootfs |
+
+```
+文件读取流程:
+容器请求 /etc/hosts
+  ↓
+先查 upper dir → 没有
+  ↓
+再查 lower dir → 找到，返回内容
+
+文件写入流程:
+容器修改 /etc/hosts
+  ↓
+先复制 lower 中的 /etc/hosts 到 upper（copy-up）
+  ↓
+修改 upper 中的副本
+```
+
+## 问题分析：为什么 Sealos 方案不适用？
+
+### Sealos CommitImage 的依赖
+
+Sealos 的 CommitImage 机制依赖以下节点级组件：
+
+| 组件 | 类型 | 用途 |
+|------|------|------|
+| **devbox snapshotter** | containerd 插件 | 基于 overlaybd/LVM 的自定义 snapshotter，每层映射到一个 LVM Logical Volume |
+| **devbox-runc runtime handler** | containerd 配置 | CRI runtime handler，关联 devbox snapshotter |
+| **overlaybd-snapshotter 二进制** | systemd 服务 | gRPC snapshotter proxy 插件进程 |
+| **containerd config.toml 修改** | 配置 | 添加 proxy_plugin 和 runtime handler 条目 |
+| **RuntimeClass CR** | 集群资源 | `devbox-runc` RuntimeClass 定义 |
+
+这些组件需要在每个节点上安装，而 VKE 作为托管集群，不允许用户在节点上安装任意软件。
+
+### 关键发现：标准接口就够用
+
+通过分析 Sealos 的 commit 源码（`controllers/devbox/internal/commit/commit.go`），我们发现一个重要事实：
+
+**Commit 核心流程使用的全是 containerd 标准的 `snapshots.Snapshotter` 接口方法：**
+
+| 方法 | 用途 | overlayfs 支持度 |
+|------|------|------------------|
+| `Stat()` | 获取快照信息 | ✅ |
+| `View()` | 创建只读视图 | ✅ |
+| `Mounts()` | 获取挂载点 | ✅ |
+| `Prepare()` | 创建可写快照 | ✅ |
+| `Commit()` | 提交快照为只读层 | ✅ |
+| `Remove()` | 删除快照 | ✅ |
+
+真正依赖 devbox snapshotter 的只有三个附加功能：
+
+| 功能 | 依赖原因 | overlayfs 下的处理 |
+|------|----------|-------------------|
+| `containerd.io/snapshot/devbox-*` 标签 | LV 管理映射、存储配额 | overlayfs 忽略标签，commit 正常工作 |
+| `SetLvRemovable()` | 标记 LV 可回收 | 不适用，overlayfs 无 LV 需清理 |
+| `RemoveBaseImageTopLayer` | 合并基础镜像顶层避免 LV 冗余 | 设为 false，保留完整层 |
+
+**结论**：使用 overlayfs snapshotter + 标准 containerd API 执行 commit，产出的 OCI 镜像完全合法可用。
+
+## 方案设计
+
+### 整体架构
+
+```
+                     Kubernetes API
+                          │
+            ┌─────────────┼─────────────┐
+            │             │             │
+      DevBox CR      Controller      Pod
+      (Spec/Status)   (Reconcile)   (Running)
+            │             │             │
+            │    ┌────────┘             │
+            │    │ Watch StateChange    │
+            │    │ (Shutdown/Stopped)   │
+            ▼    ▼                      │
+      ┌──────────────────┐              │
+      │  Commit Service  │              │
+      │  (in Controller) │              │
+      └────────┬─────────┘              │
+               │                        │
+    ┌──────────┼──────────┐             │
+    │          │          │             │
+    ▼          ▼          ▼             │
+containerd   Harbor    Update CR        │
+gRPC API    Registry   Status           │
+(overlayfs)  (Push)   (new BaseImage)   │
+               │                        │
+               └────────────────────────┘
+               下次启动 Pod 使用 commitImage
+```
+
+### 核心流程
+
+```
+DevBox Spec.State → Shutdown/Stopped
+  │
+  ├─ 1. Controller 检测状态变更，触发 commit workflow
+  │
+  ├─ 2. Commit Service 连接节点 containerd socket
+  │     └─ unix:///var/run/containerd/containerd.sock
+  │
+  ├─ 3. 按 Pod UID 查找 CRI container
+  │     └─ containerd namespace: k8s.io
+  │     └─ 通过 container label 匹配
+  │
+  ├─ 4. Commit: 容器可写层 → 新 OCI 镜像
+  │     ├─ 4a. 创建临时 container 引用（使用 overlayfs snapshotter）
+  │     ├─ 4b. container.Commit() 生成 diff 层
+  │     ├─ 4c. 构建 OCI image config + manifest
+  │     └─ 4d. 写入 containerd content store
+  │
+  ├─ 5. Push 镜像到 Harbor
+  │     └─ harbor.intra.ke.com/devbox/<namespace>/<name>:<tag>
+  │
+  ├─ 6. 清理临时资源
+  │     ├─ 删除临时 container
+  │     └─ 删除本地镜像（释放节点存储）
+  │
+  └─ 7. 更新 DevBox CR Status
+        ├─ CommitRecords[contentID].CommitStatus = Success
+        ├─ CommitRecords[contentID].CommitImage = newImage
+        ├─ 生成新 contentID
+        └─ 新 CommitRecord: { BaseImage: commitImage, CommitStatus: Pending }
+```
+
+### 与 Sealos 原生方案的对比
+
+| 维度 | Sealos 原生 | 本方案 |
+|------|------------|--------|
+| **Snapshotter** | devbox (overlaybd/LVM) | overlayfs (默认) |
+| **Runtime Handler** | devbox-runc | 默认 runc |
+| **节点级安装** | overlaybd 二进制 + systemd + containerd 配置 | 无 |
+| **Commit 方式** | nerdctl fork (含 DevboxOptions) | 标准 containerd Go SDK |
+| **层合并优化** | RemoveBaseImageTopLayer | 不使用（保留完整层） |
+| **存储配额** | LV 级别精确控制 | K8s ephemeral-storage limit |
+| **镜像大小** | 较小（合并冗余层） | 稍大（保留所有基础层） |
+| **启动速度** | LV 克隆秒级 | overlayfs 解压层（正常速度） |
+| **增量 commit** | contentID 追踪 LV | 不支持，每次全量 commit |
+
+> **trade-off 分析**：本方案放弃了 LV 级别的精确配额控制和层合并优化，换来的是零节点依赖和更简单的实现。对于 DevBox 的典型使用场景（单个开发环境，文件修改量有限），这个 trade-off 是值得的。
+
+## 详细实现
+
+### Committer 接口设计
+
+保持与 Sealos `Committer` 接口兼容，替换实现：
+
+```go
+package commit
+
+// Committer 定义容器 commit 操作的抽象接口
+type Committer interface {
+    // Commit 将 DevBox 容器的可写层提交为新镜像
+    //
+    // 参数说明:
+    //   - devboxName: DevBox CR 名称
+    //   - contentID: 当前内容版本 ID（用于生成容器名和追踪）
+    //   - baseImage: 当前运行的基础镜像
+    //   - commitImage: 目标 commit 镜像全名（含 registry/namespace/name:tag）
+    //
+    // 返回:
+    //   - containerID: 临时容器 ID，用于后续清理
+    //   - error: 错误信息
+    Commit(ctx context.Context, devboxName, contentID, baseImage, commitImage string) (containerID string, err error)
+
+    // Push 将本地镜像推送到远程 Registry
+    Push(ctx context.Context, imageName string) error
+
+    // RemoveContainers 清理临时容器
+    RemoveContainers(ctx context.Context, containerIDs []string) error
+
+    // RemoveImages 清理本地镜像（释放节点存储）
+    //   - force: 强制删除，即使有容器在使用
+    //   - async: 异步删除，不阻塞当前操作
+    RemoveImages(ctx context.Context, imageNames []string, force, async bool) error
+}
+```
+
+**与 Sealos 接口的差异**：
+
+| 方法 | Sealos | 本方案 | 说明 |
+|------|--------|--------|------|
+| `CreateContainer` | 有 | 移除 | 合并到 Commit 内部，简化接口 |
+| `SetLvRemovable` | 有 | 移除 | overlayfs 无 LV 概念 |
+| `InitializeGC` | 有 | 移除 | 简化 GC 策略 |
+
+### OverlayFS Commit 实现
+
+核心逻辑使用标准 containerd Go SDK（`github.com/containerd/containerd/v2`）：
+
+```go
+package commit
+
+import (
+    "context"
+    "fmt"
+    "time"
+
+    "github.com/containerd/containerd/v2/client"
+    "github.com/containerd/containerd/v2/core/containers"
+    "github.com/containerd/containerd/v2/core/snapshots"
+    "github.com/containerd/containerd/v2/pkg/namespaces"
+)
+
+// OverlayFSCommitter 是基于 overlayfs snapshotter 的 Committer 实现
+type OverlayFSCommitter struct {
+    client           *containerd.Client
+    snapshotterName  string  // "overlayfs"
+    namespace        string  // "k8s.io"
+    registryAddr     string
+    registryUsername string
+    registryPassword string
+}
+
+// NewOverlayFSCommitter 创建新的 Committer 实例
+func NewOverlayFSCommitter(
+    socketPath string,
+    registryAddr, username, password string,
+) (*OverlayFSCommitter, error) {
+    // 连接节点 containerd socket
+    client, err := containerd.New(socketPath)
+    if err != nil {
+        return nil, fmt.Errorf("connect containerd failed: %w", err)
+    }
+
+    return &OverlayFSCommitter{
+        client:           client,
+        snapshotterName:  "overlayfs",  // 使用默认 overlayfs snapshotter
+        namespace:        "k8s.io",       // CRI 使用的 namespace
+        registryAddr:     registryAddr,
+        registryUsername: username,
+        registryPassword: password,
+    }, nil
+}
+
+// Commit 将 DevBox 容器的可写层提交为新镜像
+func (c *OverlayFSCommitter) Commit(
+    ctx context.Context,
+    devboxName, contentID, baseImage, commitImage string,
+) (string, error) {
+    // 使用 k8s.io namespace（CRI 容器所在的 namespace）
+    ctx = namespaces.WithNamespace(ctx, c.namespace)
+
+    // 1. 拉取基础镜像（确保本地存在）
+    //    WithPullUnpack: 拉取后解压到 snapshotter，减少启动时间
+    //    WithSnapshotter("overlayfs"): 指定使用 overlayfs snapshotter
+    baseImg, err := c.client.Pull(ctx, baseImage,
+        containerd.WithPullUnpack,
+        containerd.WithSnapshotter(c.snapshotterName),
+    )
+    if err != nil {
+        return "", fmt.Errorf("pull base image failed: %w", err)
+    }
+
+    // 2. 创建临时容器
+    //    这个容器不会真正运行，只是作为 commit 的目标
+    //    WithNewSnapshot: 创建新的可写快照
+    containerName := fmt.Sprintf("devbox-commit-%s-%d", devboxName, time.Now().UnixMicro())
+    container, err := c.client.NewContainer(ctx, containerName,
+        containerd.WithImage(baseImg),
+        containerd.WithNewSnapshot(containerName+"-snapshot", baseImg,
+            containerd.WithSnapshotter(c.snapshotterName),
+        ),
+        // 添加标签，便于追踪和清理
+        containerd.WithAdditionalContainerLabels(map[string]string{
+            "devbox.sealos.io/devbox-name": devboxName,
+            "devbox.sealos.io/content-id":   contentID,
+            "devbox.sealos.io/commit-image":  commitImage,
+        }),
+    )
+    if err != nil {
+        return "", fmt.Errorf("create container failed: %w", err)
+    }
+
+    // 3. Commit 容器可写层为新镜像
+    //    使用 containerd 标准 diff API
+    //    生成的镜像包含: baseImage 的所有层 + 当前容器的 diff 层
+    image, err := container.Commit(ctx, commitImage,
+        containerd.WithSnapshotter(c.snapshotterName),
+    )
+    if err != nil {
+        return "", fmt.Errorf("commit container failed: %w", err)
+    }
+
+    // 返回容器 ID，用于后续清理
+    return container.ID(), nil
+}
+```
+
+**关键设计决策**：
+
+1. **不使用 nerdctl fork**：Sealos 使用的 `labring/nerdctl/v2` fork 包含 `DevboxOptions.RemoveBaseImageTopLayer`，这是为 devbox snapshotter 的 LV-per-layer 架构设计的。overlayfs 下不需要此功能，使用标准 containerd SDK 即可。
+
+2. **使用 overlayfs snapshotter**：这是 containerd 默认内置的 snapshotter，无需额外安装。
+
+3. **不设置 runtime handler annotation**：Sealos 在 Pod 上设置 `io.containerd.cri.runtime-handler: devbox-runc` annotation。本方案不设置此 annotation，Pod 使用默认 runc runtime。
+
+### Container 发现策略
+
+Sealos 的 commit 流程是：先 CreateContainer 创建引用 baseImage 的临时容器，再 Commit 这个临时容器。但这种方式有一个问题：**临时容器的 snapshot 不包含运行中 Pod 的文件变更**。
+
+Sealos 之所以能这样做，是因为 devbox snapshotter 的 LV 克隆机制——运行中 Pod 的 LV 和临时容器的 LV 共享同一个 contentID，snapshot 指向同一份数据。
+
+**overlayfs 方案需要不同的策略**：直接 commit 运行中 Pod 的容器。
+
+```go
+// findContainerByPodUID 根据 Pod UID 查找对应的 containerd 容器
+//
+// CRI 创建的容器带有特定的 label:
+//   - io.cri-containerd: "true" (标识由 CRI 创建)
+//   - io.kubernetes.pod.uid: <pod-uid> (关联 Pod UID)
+func (c *OverlayFSCommitter) findContainerByPodUID(
+    ctx context.Context,
+    podUID string,
+) (containerd.Container, error) {
+    ctx = namespaces.WithNamespace(ctx, c.namespace)
+
+    // 列出 k8s.io namespace 下的所有容器
+    containers, err := c.client.Containers(ctx)
+    if err != nil {
+        return nil, fmt.Errorf("list containers failed: %w", err)
+    }
+
+    // 遍历容器，查找匹配 Pod UID 的容器
+    for _, ctr := range containers {
+        labels, err := ctr.Labels(ctx)
+        if err != nil {
+            continue  // 跳过无法读取标签的容器
+        }
+
+        // CRI 创建的容器带有 io.cri-containerd: true 标签
+        // io.kubernetes.pod.uid 标签包含 Pod UID（可能带前缀）
+        if labels["io.cri-containerd"] == "true" &&
+           strings.HasPrefix(labels["io.kubernetes.pod.uid"], podUID) {
+            return ctr, nil
+        }
+    }
+
+    return nil, fmt.Errorf("container not found for pod UID: %s", podUID)
+}
+```
+
+**两种 commit 策略对比**：
+
+| 策略 | 说明 | 优点 | 缺点 |
+|------|------|------|------|
+| **A. Commit 运行中容器** | 直接找到 Pod 对应的 containerd container 并 commit | ✅ 捕获完整运行状态 | ❌ 需要 Pod 仍存在 |
+| **B. 先 Pause 再 Commit** | 先 pause 容器确保文件系统一致，再 commit | ✅ 数据一致性更好 | ❌ 需要容器支持 pause |
+
+**推荐策略 A**，因为 DevBox 关机流程中，Controller 会先设置 `CommitStatus=Committing`，此时 Pod 仍在运行但用户已无法操作。commit 完成后才删除 Pod。
+
+### 镜像命名规则
+
+与 Sealos 保持一致的命名规则：
+
+```
+<registry>/<namespace>/<devbox-name>:<random-5chars>-<datetime>
+```
+
+示例：
+```
+harbor.intra.ke.com/devbox/devbox-test/my-devbox:x7k2m-2026-05-14-123000
+```
+
+命名规则的设计考虑：
+- **registry**：内部 Harbor 地址
+- **namespace**：项目/租户隔离
+- **devbox-name**：明确归属的 DevBox
+- **random-5chars**：避免并发冲突
+- **datetime**：便于追溯和管理
+
+### 资源清理（GC）
+
+Sealos 使用 `SetLvRemovable` + devbox snapshotter 的标签机制来清理 LV。overlayfs 方案使用更简单的策略：
+
+```go
+// Cleanup 清理 commit 产生的临时资源
+func (c *OverlayFSCommitter) Cleanup(ctx context.Context) error {
+    ctx = namespaces.WithNamespace(ctx, c.namespace)
+
+    // 1. 查找所有 devbox-commit-* 容器
+    containers, err := c.client.Containers(ctx, filters.WithPrefix("labels", "devbox.sealos.io/devbox-name"))
+    if err != nil {
+        return err
+    }
+
+    var containerIDs []string
+    for _, ctr := range containers {
+        labels, _ := ctr.Labels(ctx)
+        if _, ok := labels["devbox.sealos.io/devbox-name"]; ok {
+            containerIDs = append(containerIDs, ctr.ID())
+        }
+    }
+
+    // 2. 删除临时容器
+    if err := c.RemoveContainers(ctx, containerIDs); err != nil {
+        return fmt.Errorf("remove containers failed: %w", err)
+    }
+
+    // 3. 删除本地镜像（引用计数为 0 时）
+    //    已 push 到 Harbor，本地不再需要
+    //    通过 Harbor Tag Retention Policy 清理 Registry 侧的旧镜像
+    return nil
+}
+```
+
+清理策略：
+
+| 策略 | 时机 | 内容 |
+|------|------|------|
+| **立即清理** | Commit 完成后 | 删除临时容器 + 本地 commit 镜像 |
+| **定期 GC** | Controller 启动时 | 清理所有遗留的 devbox-commit-* 资源 |
+| **镜像保留** | Harbor 侧 | 通过 Harbor Tag Retention Policy 保留最近 N 个 |
+
+### DevBox CR 状态流转
+
+保持与 Sealos 完全兼容的状态流转：
+
+```
+Running ──[shutdown/stop]──► Committing ──[commit success]──► Shutdown/Stopped
+    │                           │
+    │                           └──[commit fail]──► CommitFailed (retry)
+    │
+    └──[start]──► Creating Pod ──► Running (使用 commitImage 作为 BaseImage)
+```
+
+CommitRecord 结构不变：
+
+```go
+// CommitRecord 记录一次 commit 操作的元数据
+type CommitRecord struct {
+    BaseImage    string       // commit 使用的源镜像
+    CommitImage  string       // commit 产出的目标镜像
+    Node         string       // commit 发生的节点
+    CommitStatus CommitStatus // Pending → Committing → Success/Failed
+    GenerateTime metav1.Time
+    CommitTime   metav1.Time
+    UpdateTime   metav1.Time
+}
+```
+
+## 所需依赖
+
+### 最小集群依赖
+
+| 依赖 | 说明 | 是否需要节点级操作 |
+|------|------|-------------------|
+| containerd socket 挂载 | Controller Pod 挂载 `/var/run/containerd/containerd.sock` | 否（Pod spec 配置） |
+| Harbor Registry | 存储 commit 镜像 | 否（独立服务） |
+| DevBox CRD | `devbox.sealos.io/v1alpha2` | 否（kubectl apply） |
+| RBAC | Controller 权限 | 否（kubectl apply） |
+| RuntimeClass `devbox-runc` | ❌ 不需要 | — |
+| devbox snapshotter | ❌ 不需要 | — |
+| overlaybd-snapshotter | ❌ 不需要 | — |
+| containerd config.toml 修改 | ❌ 不需要 | — |
+
+### Go 依赖
+
+```go
+// go.mod 新增
+require (
+    github.com/containerd/containerd/v2 v2.x.x      // containerd Go SDK
+    github.com/containerd/errdefs v0.x.x             // 错误定义
+    github.com/opencontainers/go-digest v1.x.x       // OCI digest
+    github.com/opencontainers/image-spec v1.x.x      // OCI image spec
+)
+```
+
+**不需要的依赖**（相比 Sealos 方案减少）：
+
+```go
+// 不需要
+github.com/containerd/nerdctl/v2                  // nerdctl fork
+github.com/containerd/accelerated-container-image  // overlaybd snapshotter
+```
+
+### Controller Pod 部署配置
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devbox-controller-manager
+  namespace: devbox-system
+spec:
+  template:
+    spec:
+      containers:
+      - name: manager
+        image: devbox-controller:latest
+        args:
+        - --disable-commit=false
+        - --registry-addr=harbor.intra.ke.com/devbox
+        - --registry-user=admin
+        - --registry-password=$(REGISTRY_PASSWORD)
+        - --merge-base-image-top-layer=false  # overlayfs 下必须为 false
+        env:
+        - name: REGISTRY_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: harbor-credentials
+              key: password
+        volumeMounts:
+        # 挂载 containerd socket，用于 commit 操作
+        - name: containerd-sock
+          mountPath: /var/run/containerd/containerd.sock
+          readOnly: true
+        # 挂载 containerd state 目录，用于 overlayfs snapshotter
+        - name: containerd-state
+          mountPath: /var/lib/containerd
+          readOnly: true
+      volumes:
+      - name: containerd-sock
+        hostPath:
+          path: /var/run/containerd/containerd.sock
+          type: Socket
+      - name: containerd-state
+        hostPath:
+          path: /var/lib/containerd
+          type: Directory
+```
+
+## 验证方案
+
+### Phase 1: 本地验证
+
+目标：验证 containerd commit + overlayfs 可以产出可用镜像。
+
+```bash
+# 1. 启动测试容器
+ctr -n k8s.io run --snapshotter overlayfs docker.io/library/alpine:3.19 test-devbox /bin/sh -c "echo 'hello devbox' > /tmp/test.txt"
+
+# 2. 手动 commit
+ctr -n k8s.io commit test-devbox harbor.intra.ke.com/devbox/test-commit:v1
+
+# 3. Push
+ctr -n k8s.io push harbor.intra.ke.com/devbox/test-commit:v1
+
+# 4. 验证
+ctr -n k8s.io run harbor.intra.ke.com/devbox/test-commit:v1 verify-devbox cat /tmp/test.txt
+# 期望输出: hello devbox
+```
+
+**验证点**：
+- [ ] overlayfs snapshotter 下 commit 正常
+- [ ] commit 产出的镜像可以 push 到 Harbor
+- [ ] pull 后文件完整
+
+### Phase 2: 集群内验证
+
+目标：在 VKE 集群中验证完整 commit 流程。
+
+```bash
+# 1. 创建 DevBox
+kubectl apply -f - <<EOF
+apiVersion: devbox.sealos.io/v1alpha2
+kind: Devbox
+metadata:
+  name: test-commit
+  namespace: devbox-test
+spec:
+  state: Running
+  image: harbor.intra.ke.com/infra/devbox/go:1.22
+  resource:
+    cpu: "2"
+    memory: 4Gi
+  network:
+    type: SSHGate
+  config:
+    user: devbox
+EOF
+
+# 2. 等待 Running
+kubectl wait devbox test-commit -n devbox-test --for=jsonpath='{.status.phase}'=Running --timeout=120s
+
+# 3. SSH 写入测试文件
+ssh devbox@<gateway> -p 2222 -i <key> "echo 'commit-test-$(date)' > /home/devbox/commit-test.txt"
+
+# 4. 关机
+kubectl patch devbox test-commit -n devbox-test --type=merge -p '{"spec":{"state":"Shutdown"}}'
+
+# 5. 观察日志
+kubectl logs -n devbox-system deployment/devbox-controller-manager -f
+
+# 6. 重新启动
+kubectl patch devbox test-commit -n devbox-test --type=merge -p '{"spec":{"state":"Running"}}'
+
+# 7. 验证
+ssh devbox@<gateway> -p 2222 -i <key> "cat /home/devbox/commit-test.txt"
+# 期望输出: commit-test-<timestamp>
+```
+
+**验证点**：
+- [ ] Controller 启动不报错（无 devbox snapshotter 连接失败）
+- [ ] 创建的 Pod 无 `io.containerd.cri.runtime-handler` annotation
+- [ ] 关机触发 commit workflow
+- [ ] Commit 状态流转：Pending → Committing → Success
+- [ ] commit 镜像成功 push 到 Harbor
+- [ ] 重启后 Pod 使用 commitImage
+- [ ] 重启后文件完整
+
+### Phase 3: 边界场景验证
+
+| 场景 | 验证内容 |
+|------|---------|
+| 大文件 commit | 在 DevBox 中写入 1GB+ 文件后关机，验证 commit 和启动 |
+| 多次 commit | 连续 stop/start 5 次，验证每次 commit 镜像正确 |
+| commit 失败重试 | 模拟 Harbor 不可用，验证 retry 逻辑 |
+| 并发 commit | 同时关机 3 个 DevBox，验证无竞态条件 |
+| 磁盘满 | 节点存储不足时 commit，验证错误处理 |
+
+## 风险与缓解
+
+| 风险 | 影响 | 缓解措施 |
+|------|------|---------|
+| overlayfs commit 镜像比 devbox snapshotter 大 | 存储成本增加 | Harbor Tag Retention Policy 自动清理旧镜像 |
+| 无法找到运行中 Pod 的 containerd container | commit 失败 | 备选方案：先创建临时 container 再 commit（牺牲实时性） |
+| containerd socket 权限 | Controller 无法连接 | 确保 Pod spec 挂载 socket + hostPath |
+| VKE 节点 containerd 版本不兼容 | Go SDK 调用失败 | 运行时检测 containerd 版本，最低要求 v1.7+ |
+| commit 过程中 Pod 被强制删除 | 数据丢失 | Controller 在 commit 完成前不删除 Pod |
+
+## 备选方案
+
+如果 containerd Go SDK 直接 commit 运行中容器的方案遇到问题，有以下备选：
+
+### 方案 B: 在 Pod 内执行 commit
+
+不连接节点 containerd，而是在 DevBox Pod 内安装 `crane` 或 `buildkit`，在容器内部将文件系统打包为镜像层并推送。
+
+| 优点 | 缺点 |
+|------|------|
+| 不需要 containerd socket 挂载 | 需要在 DevBox 基础镜像中预装 crane/buildkit |
+| 不需要节点级任何权限 | commit 过程占用 Pod 内资源 |
+| 适用于无法挂载 socket 的托管集群 | 实现复杂度较高 |
+
+### 方案 C: CRI API commit
+
+通过 CRI (Container Runtime Interface) API 查询容器信息，再通过 containerd API commit。这是方案 A 的变体，增加了 CRI 查询步骤提高容器发现可靠性。
+
+### 方案 D: 外部构建服务 commit
+
+不在 Controller 内 commit，而是调用外部构建 API，在构建容器中完成 commit：
+
+```
+关机时
+  ↓
+1. 将 DevBox 文件系统 tar 打包上传
+  ↓
+2. 调用构建 API，以 tar 作为 context 构建新镜像
+  ↓
+3. 构建服务 push 到 Harbor
+```
+
+| 优点 | 缺点 |
+|------|------|
+| 完全解耦，Controller 不需要任何节点级访问 | 需要打包上传整个文件系统（网络开销大） |
+| 可复用已有构建基础设施 | 构建时间较长 |
+
+## 总结
+
+本方案通过使用 containerd 标准接口和 overlayfs snapshotter，实现了零节点依赖的 CommitImage 能力，解决了在 VKE 托管集群中部署 DevBox 的问题。
+
+**核心价值**：
+- ✅ 零节点依赖，适用于任何基于 containerd 的 Kubernetes 集群
+- ✅ 使用标准 OCI 镜像格式，与主流容器生态兼容
+- ✅ 代码量少，维护成本低
+- ⚠️ 镜像稍大（保留所有基础层）
+- ⚠️ 不支持增量 commit（每次全量）
+
+对于 CloudStudio 的使用场景，这些 trade-off 是完全可接受的。
+
+## 参考资料
+
+- [containerd 官方文档](https://containerd.io/)
+- [OCI 镜像规范](https://github.com/opencontainers/image-spec)
+- [OverlayFS 内核文档](https://docs.kernel.org/filesystems/overlayfs.html)
+- [Sealos DevBox GitHub](https://github.com/labring/sealos)
+- [Kubernetes 容器运行时接口](https://kubernetes.io/docs/concepts/architecture/#the-container-runtime-interface)
